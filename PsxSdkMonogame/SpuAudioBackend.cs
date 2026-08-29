@@ -33,6 +33,16 @@ namespace PsxSdkMonogame;
 // which already runs on the game thread, never RenderSamples. The throttled PE_AUDIO_DIAG line
 // below also no longer calls Console.WriteLine directly (it can block on a redirected pipe); it
 // goes through AsyncConsole instead, for the same reason.
+//
+// SD1 (2026-08-29): shutdown lifecycle. MonoGame owns the DynamicSoundEffectInstance as well as
+// this class does -- Game.Dispose() shuts the audio subsystem down and disposes every live
+// instance, ours included. Nothing used to stop this pump thread at application exit (Dispose()
+// had no caller at all, and Stop() only ran on the Akao DisableEvent path), so the thread went on
+// calling PendingBufferCount on an instance MonoGame had just disposed, and the resulting
+// ObjectDisposedException on a thread with no handler took the process down on the way out. Two
+// changes close it: the host now disposes the backend before MonoGame tears audio down (see
+// GameRemaster.OnExiting), and every instance touch below is guarded so this thread survives the
+// device disappearing under it in any ordering this class does not control.
 public sealed class SpuAudioBackend : IDisposable
 {
     private const int SampleRate = 44100;
@@ -121,10 +131,17 @@ public sealed class SpuAudioBackend : IDisposable
             return;
 
         bool haveDevice;
+        _deviceLossLogged = false;
         lock (_instanceLock)
         {
             try
             {
+                // SD1: Stop() used to leave the previous instance alive (stopped, but neither
+                // disposed nor released), so every Stop()/Start() cycle -- one per scene
+                // transition, via ShutdownAkaoSystem/InitSpuAndTimerEvent -> DisableEvent/
+                // EnableEvent -- leaked one DynamicSoundEffectInstance into MonoGame's instance
+                // pool, which is capped. Release it here before taking a new one.
+                DisposeInstanceLocked();
                 _instance = new DynamicSoundEffectInstance(SampleRate, Channels);
                 for (int i = 0; i < QueuedBuffers; i++)
                     SubmitOneBufferLocked();
@@ -155,22 +172,45 @@ public sealed class SpuAudioBackend : IDisposable
     // for "no sound card present" — this just paces RenderSamples by wall-clock sleep so the tick
     // callback (and with it AkaoTick's own sequencing) keeps advancing on a machine with no audio
     // output, exactly like the old silent-fallback timer did, just on this thread instead.
+    //
+    // SD1 (2026-08-29): haveDevice is a mutable LOCAL, not a fixed one, because the device can go
+    // away under this thread (see the class note). On loss the loop DEGRADES to the no-device path
+    // instead of returning: the tick callback this pump drives is the Akao ISR (FUN_8008e23c), and
+    // stopping it stops AKAO's own sequencing, so the clock must keep advancing for as long as
+    // _running says the backend is meant to be live. Stop()/Dispose() clear _running first, so a
+    // deliberate teardown still ends the loop rather than spinning on the silent path.
     private void AudioThreadLoop(bool haveDevice)
     {
         while (_running)
         {
             if (haveDevice)
             {
-                lock (_instanceLock)
+                try
                 {
-                    if (_instance == null) return;
-                    if (_instance.PendingBufferCount < QueuedBuffers)
+                    lock (_instanceLock)
                     {
-                        SubmitOneBufferLocked();
-                        continue;
+                        if (_instance == null || _instance.IsDisposed)
+                        {
+                            haveDevice = false;
+                            MaybeLogDeviceLoss();
+                            continue;
+                        }
+
+                        if (_instance.PendingBufferCount < QueuedBuffers)
+                        {
+                            SubmitOneBufferLocked();
+                            continue;
+                        }
                     }
+                    Thread.Sleep(1);
                 }
-                Thread.Sleep(1);
+                catch (ObjectDisposedException)
+                {
+                    // Disposed between the IsDisposed check above and the call itself -- MonoGame's
+                    // shutdown does not take _instanceLock, so no guard can make that window empty.
+                    haveDevice = false;
+                    MaybeLogDeviceLoss();
+                }
             }
             else
             {
@@ -183,6 +223,8 @@ public sealed class SpuAudioBackend : IDisposable
     }
 
     // JUSTIFICATION: backend MonoGame only
+    // SD1: releases the device outright rather than parking a stopped-but-live instance, so a later
+    // Start() cannot pile a second one on top of it -- see Start()'s own note.
     public void Stop()
     {
         _running = false;
@@ -191,12 +233,16 @@ public sealed class SpuAudioBackend : IDisposable
 
         lock (_instanceLock)
         {
-            _instance?.Stop();
+            DisposeInstanceLocked();
         }
         _wavDump?.Flush();
     }
 
     // JUSTIFICATION: backend MonoGame only
+    // RELATION: SD1 -- the host calls this on its exit path (GameRemaster.OnExiting), BEFORE
+    // MonoGame's own Game.Dispose() shuts the audio subsystem down, so the pump thread is already
+    // joined and the instance already released by the time MonoGame disposes what is left.
+    // Idempotent: safe after Stop(), and safe to call twice.
     public void Dispose()
     {
         _running = false;
@@ -205,14 +251,32 @@ public sealed class SpuAudioBackend : IDisposable
 
         lock (_instanceLock)
         {
-            if (_instance != null)
-            {
-                _instance.Stop();
-                _instance.Dispose();
-                _instance = null;
-            }
+            DisposeInstanceLocked();
         }
         _wavDump?.Flush();
+    }
+
+    // JUSTIFICATION: backend MonoGame only -- must be called with _instanceLock already held.
+    // SD1: Stop() and Dispose() on a DynamicSoundEffectInstance both assert not-disposed and throw
+    // ObjectDisposedException, and MonoGame may already have disposed it from its own shutdown, so
+    // neither call may be made unguarded. IsDisposed is checked first for the ordinary case; the
+    // catch covers the race, since MonoGame's shutdown does not take this lock.
+    private void DisposeInstanceLocked()
+    {
+        DynamicSoundEffectInstance instance = _instance;
+        _instance = null;
+        if (instance == null)
+            return;
+
+        try
+        {
+            if (!instance.IsDisposed)
+                instance.Stop();
+            instance.Dispose();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
     }
 
     // JUSTIFICATION: backend MonoGame only — must be called with _instanceLock already held.
@@ -263,5 +327,17 @@ public sealed class SpuAudioBackend : IDisposable
         _diagStopwatch.Restart();
         int windowMax = ReadAndResetWindowMaxPeakAmplitude();
         AsyncConsole.WriteLine($"[PE_AUDIO_DIAG] peak={peak} windowMax={windowMax}");
+    }
+
+    // JUSTIFICATION: backend MonoGame only -- one-shot diagnostic for SD1's device-loss path, gated
+    // behind PE_AUDIO_DIAG like MaybeLogPeakAmplitude so ordinary play prints nothing. Written and
+    // read only from the pump thread (reset by Start(), which cannot run while that thread lives).
+    private bool _deviceLossLogged;
+    private void MaybeLogDeviceLoss()
+    {
+        if (!s_diagEnabled || _deviceLossLogged)
+            return;
+        _deviceLossLogged = true;
+        AsyncConsole.WriteLine("[PE_AUDIO_DIAG] audio device disposed under the pump thread; degraded to silent pacing");
     }
 }
