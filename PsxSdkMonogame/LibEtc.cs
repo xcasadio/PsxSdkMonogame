@@ -100,10 +100,36 @@ public static class LibEtc
         return default;
     }
 
+    // GHIDRA: DMACallback @ 0x80073CF4
+    // PROOF: CERTAIN interface (channel index + callback, returns the previous callback) — real
+    // per-channel registry, replacing the prior no-op. 7 channels (0=MDEC-in, 1=MDEC-out, 2=GPU,
+    // 3=CDROM, 4=SPU, 5=PIO, 6=OTC — the standard PSX DMA channel assignment), matching libetc's own
+    // DMACallback table size. Added for slice S2 (LibPress.DecDCTin/DecDCTout register/invoke
+    // channel 0/1 through this — see LibPress.cs's DecDCTinCallback/DecDCToutCallback). No call site
+    // in the ported game exists yet (grepped clean at slice S2 time), so this change is behaviourally
+    // inert for every currently-live path; it only starts mattering once LibPress or a future FMV
+    // driver slice calls it.
+    private static readonly Action[] s_dmaCallbacks = new Action[7];
+
     public static object DMACallback(int dma, Action callback)
     {
-        // Do nothing
-        return default;
+        if (dma < 0 || dma >= s_dmaCallbacks.Length)
+        {
+            return null;
+        }
+
+        Action previous = s_dmaCallbacks[dma];
+        s_dmaCallbacks[dma] = callback;
+        return previous;
+    }
+
+    // JUSTIFICATION: desktop adaptation helper — lets LibPress invoke the DMA channel-1 (MDEC-out)
+    // callback registered above without duplicating the registry. Not part of the original libetc
+    // API surface (the original only exposes registration; invocation is the IRQ handler's job,
+    // which has no desktop equivalent — see LibPress.DecDCTout for the synchronous adaptation).
+    public static Action GetDmaCallback(int dma)
+    {
+        return dma >= 0 && dma < s_dmaCallbacks.Length ? s_dmaCallbacks[dma] : null;
     }
 
     public static int ResetCallback()

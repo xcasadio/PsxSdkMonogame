@@ -1412,7 +1412,15 @@ public static class LibGpu
     // to the byte[] the port uses to model that span of PSX RAM, as (buffer, offset), or null when
     // the address maps to nothing. Which byte[] models which span is game-specific, so the game
     // installs this at startup (see the game's PsxSdkBridges).
-    public static Func<int, (byte[] buffer, int offset)?> RamAddressResolver;
+    // This is now a thin delegating property over the shared PsxRam.AddressResolver hook (see
+    // PsxRam.cs) so LibGpu and other SDK modules (LibCd's St* ring API) resolve PSX addresses
+    // through one installed mapping. Existing game wiring (`LibGpu.RamAddressResolver = ...`)
+    // keeps working unchanged — it now just writes through to PsxRam.AddressResolver.
+    public static Func<int, (byte[] buffer, int offset)?> RamAddressResolver
+    {
+        get => PsxRam.AddressResolver;
+        set => PsxRam.AddressResolver = value;
+    }
 
     // JUSTIFICATION: PSX hardware adaptation only — int overload used when the source pointer is
     // stored as a raw PSX address in an int global. Resolves that address through
