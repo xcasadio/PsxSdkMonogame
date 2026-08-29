@@ -653,6 +653,36 @@ public sealed class SpuCore
             mixL = (int)(((long)mixL * mainVolL) >> 15);
             mixR = (int)(((long)mixR * mainVolR) >> 15);
 
+            // JUSTIFICATION: PSX hardware adaptation only (slice S4, XA movie audio)
+            // RELATION: the SPU's CD-audio input path — distinct from the 24-voice ADPCM engine
+            // mixed above. Two volume stages, both real hardware: the CD controller's own ATV
+            // routing matrix (XaAudio.SetAtv, written by LibCd.CdMix/LibDs.DsMix — the FMV driver's
+            // own fade path, e.g. PeSection70Overlay.cs:1657 -> Spu_SetVoiceVolume -> CdMix) crosses/
+            // scales the decoded L/R pair before the SPU's own RegCdVolL/R apply a second, per-
+            // channel volume (0x7FFF/unity by the ported AKAO init with cd.mix enabled — LibSpu.
+            // SpuSetCommonAttr, PsxSystems/Akao.cs:2900-2913). Gated on SPUCNT bit 0 (CD Audio
+            // Enable) like every other CD-input mix bit on real hardware.
+            // PLACEMENT (PROBABLE, not directly evidenced by a disassembled mixer routine): summing
+            // the CD input AFTER the voice engine's own master volume (RegMainVolL/R) rather than
+            // before it is the behaviour essentially every PSX emulator's SPU core implements — CD/
+            // external inputs bypass Main Volume on real hardware (psx-spx's own mixer diagram places
+            // CD IN downstream of the Voice Mixing OUT main-volume stage) — so this is the emulator-
+            // consensus placement, not an independently derived primary-source fact.
+            if ((ReadReg16(RegSpucnt) & 1) != 0)
+            {
+                XaAudio.TryReadFrame(out short xaL, out short xaR);
+                XaAudio.GetAtv(out byte atv0, out byte atv1, out byte atv2, out byte atv3);
+
+                int spuLIn = (xaL * atv0) / 0x80 + (xaR * atv3) / 0x80;
+                int spuRIn = (xaR * atv2) / 0x80 + (xaL * atv1) / 0x80;
+
+                short cdVolL = (short)ReadReg16(RegCdVolL);
+                short cdVolR = (short)ReadReg16(RegCdVolR);
+
+                mixL += (int)(((long)spuLIn * cdVolL) >> 15);
+                mixR += (int)(((long)spuRIn * cdVolR) >> 15);
+            }
+
             interleavedStereo[f * 2] = ClampSample(mixL);
             interleavedStereo[f * 2 + 1] = ClampSample(mixR);
         }

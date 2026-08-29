@@ -329,8 +329,17 @@ public static class LibDs
         return null;
     }
 
+    // JUSTIFICATION: PSX hardware adaptation only (slice S4, XA movie audio)
+    // RELATION: libds' own alias of libcd's CdMix — same CD controller ATV routing matrix, same
+    // storage (see LibCd.CdMix's own note for the two-volume-stage CD-audio path this feeds).
+    // Previously a no-op; now a thin pass-through to the same XaAudio store CdMix writes.
     public static int DsMix(DslATV vol)
     {
+        if (vol != null)
+        {
+            XaAudio.SetAtv(vol.val0, vol.val1, vol.val2, vol.val3);
+        }
+
         return 0;
     }
 

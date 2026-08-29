@@ -168,9 +168,20 @@ public static class LibCd
         return default;
     }
 
+    // JUSTIFICATION: PSX hardware adaptation only (slice S4, XA movie audio)
+    // RELATION: real PSX BIOS CD-library call — CdMix(CdlATV*) sets the CD controller's own ATV
+    // (Audio-To-Volume) routing matrix, NOT an SPU register; this is the FIRST of the two volume
+    // stages the CD-audio-to-SPU path applies (the second is RegCdVolL/R — see SpuCore.RenderSamples'
+    // own note on its CD-input mix). The port's own call site is Spu_SetVoiceVolume (FmvStream.cs:
+    // 986-1031 / PeSection70Overlay.cs:1657), the FMV driver's fade path. Previously a no-op; now
+    // stores the four routing values for XaAudio to read.
     public static int CdMix(CdlATV vol)
     {
-        /* Do nothing */
+        if (vol != null)
+        {
+            XaAudio.SetAtv(vol.val0, vol.val1, vol.val2, vol.val3);
+        }
+
         return default;
     }
 
@@ -412,14 +423,23 @@ public static class LibCd
             byte submode = sector[2];
             bool isAudio = (submode & 0x04) != 0;
 
+            if (isAudio)
+            {
+                // Slice S4: interleaved XA-ADPCM movie audio sectors (submode bit 0x04, including
+                // the 0xE4 = Audio+EOF last-sector marker) flow to XaAudio's decoder/resampler/FIFO
+                // instead of being dropped — they never occupy a ring slot (video-only ring, as
+                // before), so the ring's own contract is unchanged.
+                XaAudio.SubmitSector(sector);
+                continue;
+            }
+
             byte[] data = new byte[2048];
             Array.Copy(sector, 8, data, 0, 2048);
             ushort type = (ushort)(data[2] | (data[3] << 8));
 
-            if (isAudio || type != 0x8001)
+            if (type != 0x8001)
             {
-                // XA audio (or anything not a video sector) is dropped at ingest — movie audio is
-                // out of scope for this slice.
+                // Anything else (padding/non-video, non-audio) is dropped at ingest.
                 continue;
             }
 
@@ -570,5 +590,10 @@ public static class LibCd
         s_ringSize = 0;
         s_lastDeliveredAbsSector = -1;
         s_lastDeliveredFrameNumber = -1;
+
+        // Slice S4: teardown also owns clearing XaAudio's FIFO/predictor state, matching every other
+        // piece of stream state this method resets — a mid-movie stall-recovery re-seek goes through
+        // DsRead2 instead (never this method), so audio continuity across THAT path is preserved.
+        XaAudio.Flush();
     }
 }
