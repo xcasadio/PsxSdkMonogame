@@ -37,12 +37,17 @@ public static class FrameBaton
     private static readonly SemaphoreSlim MayContinue = new(0, 1);
     private static volatile Exception _fault;
     private static volatile bool _shutdown;
+    private static volatile bool _runtimeCompleted;
 
     // JUSTIFICATION: backend MonoGame only — an unhandled exception on the game thread must still
     // surface to the host (this is essential for porting: a swallowed exception on a background
     // thread would silently freeze the game instead of showing the crash). The host polls this
     // once per frame and re-throws/exits.
     public static Exception PendingFault => _fault;
+
+    // JUSTIFICATION: backend MonoGame only — lets the host retain the final published frame when
+    // an incremental runtime slice reaches its explicit boundary instead of waiting forever.
+    public static bool RuntimeCompleted => _runtimeCompleted;
 
     // JUSTIFICATION: PSX hardware adaptation only — called from the game-thread wrapper's catch
     // block. Records the fault AND releases the host's wait, so a crash occurring before the game
@@ -51,6 +56,14 @@ public static class FrameBaton
     public static void CaptureFault(Exception exception)
     {
         _fault = exception;
+        FrameReady.Release();
+    }
+
+    // JUSTIFICATION: backend MonoGame only — wakes a host waiting for the next VSync when the
+    // translated runtime returns normally at an intentional incremental-port boundary.
+    public static void CompleteRuntime()
+    {
+        _runtimeCompleted = true;
         FrameReady.Release();
     }
 

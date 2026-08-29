@@ -237,16 +237,18 @@ public static class LibSpu
         public int low_priority;
         public SpuStVoiceAttr[] voice = new SpuStVoiceAttr[24];
     }
-    // GHIDRA: SpuInit / SpuInitHot — no symbols in SLUS_006.62.
-    // Verified by find-cross-references in Ghidra: neither name resolves in this binary at all (not
-    // "zero xrefs" — genuinely absent). libspu is linked statically, but only the object code the
-    // linker's used-symbol pass actually pulled in is present; the game reaches _SpuInit @0x8007d074
-    // directly (see SpuStart below), never through either public entry point, so the linker dropped
-    // both. There is no MIPS to transliterate — left as "Do nothing PSX SDK" stubs.
+    // GHIDRA: SpuInit @ 0x8002C1DC in DBZ Legends SLPS_003.55.
+    // JUSTIFICATION: PSX hardware adaptation only — the physical SPU runs continuously after
+    // initialization; the dedicated desktop audio pump is the corresponding device clock.
+    // Parasite Eve SLUS_006.62 does not link this public entry point and starts the same backend
+    // through its timer-event adapter, so its existing path is unchanged.
     public static void SpuInit()
     {
-        // Do nothing PSX SDK — not linked into SLUS_006.62 (see note above).
+        AudioBackend.Start();
     }
+
+    // SpuInitHot is not linked into Parasite Eve SLUS_006.62; no DBZ call is currently mapped to
+    // this SDK entry point either.
     public static void SpuInitHot()
     {
         // Do nothing PSX SDK — not linked into SLUS_006.62 (see note above).

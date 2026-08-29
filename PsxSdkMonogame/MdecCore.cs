@@ -16,17 +16,16 @@ namespace PsxSdkMonogame;
 //      IQ table note below) reproduce exactly from the public STR v2 spec's default matrix.
 //   2. The macroblock scan order, block order, bitstream framing, VLC (Huffman) table, dequant
 //      formula and RGB conversion formula are all independently documented in the public,
-//      long-established "PSX STR video" reverse-engineering literature (psx-spx, jPSXdec) and were
-//      re-derived from jPSXdec's own (BSD-licensed) source during this slice's discovery — not
-//      taken on faith from a single source. Bit-exactness with the console chip is explicitly NOT
-//      required this slice (see LibPress.DecDCTvlc2's header note); this is a spec-based decoder.
+//      long-established PSX STR literature. The implementation follows the MIT-licensed
+//      PlayStation1_STR_format specification and uses jPSXdec only as an independent behavioral
+//      oracle. Bit-exactness with the console chip is explicitly NOT required; this is a
+//      spec-based decoder.
 public sealed class MdecCore
 {
-    // PARTIAL: hardcoded to this game's only FMV resolution. All 47 FMV1 movies in this title are
-    // 320x240 (confirmed via the St ring header's width/height fields — see LibCd.cs's St* note and
-    // this slice's FmvDecode harness output). A title with other resolutions would need these to
-    // become per-frame state fed from the BS frame header's own width/height, which this format
-    // does not actually carry (STR v2's 8-byte header has no width/height field — see DecDCTvlc2).
+    // PARTIAL: hardcoded to the 320x240 resolution proven for the currently ported FMVs: all 47
+    // Parasite Eve FMV1 movies and all 90 frames of DBZ Legends BANDAI.STR. A title with other
+    // dimensions would need these to become per-frame state fed from the St sector header; the
+    // demultiplexed BS v2/v3 header itself has no width/height fields.
     public const int FrameWidth = 320;
     public const int FrameHeight = 240;
     public const int MacroblockSize = 16;
@@ -107,10 +106,9 @@ public sealed class MdecCore
 
     // ------------------------------------------------------------------------------------------
     // AC coefficient VLC (Huffman) table — the standard MPEG-1 "DCT coefficients, table zero"
-    // (ISO/IEC 11172-2 Annex B), which is also the table the public PSX STR-video RE literature
-    // documents for MDEC AC coefficients (this port re-derived it from jPSXdec's BSD-licensed
-    // ZeroRunLengthAcLookup_STR table during this slice's discovery, cross-checked against the
-    // structurally-identical MPEG-1 spec table). Each entry is (run, level); the level is a
+    // (ISO/IEC 11172-2 Annex B), also documented for MDEC by the MIT-licensed
+    // PlayStation1_STR_format specification and behaviorally cross-checked with jPSXdec. Each
+    // entry is (run, level); the level is a
     // magnitude only — a single sign bit follows every matched code (0=positive, 1=negative). Two
     // codes are handled separately, not through this table: End-of-block ("10") and the fixed-width
     // escape marker ("000001", followed by a raw 6-bit run + 10-bit signed level with no sign bit
@@ -239,6 +237,35 @@ public sealed class MdecCore
 
     private const string EndOfBlockBits = "10";
     private const string EscapeBits = "000001";
+
+    // STR v3 DC Huffman tables from the MIT-licensed PlayStation 1 STR format specification.
+    // Each tuple is (prefix bits, prefix length, signed differential payload length). Chroma uses
+    // the MPEG-1 chroma table; all four luma blocks share the MPEG-1 luma table and one predictor.
+    private static readonly (int Code, int CodeLength, int DifferentialLength)[] V3ChromaDcTable =
+    {
+        (0b00, 2, 0),
+        (0b01, 2, 1),
+        (0b10, 2, 2),
+        (0b110, 3, 3),
+        (0b1110, 4, 4),
+        (0b11110, 5, 5),
+        (0b111110, 6, 6),
+        (0b1111110, 7, 7),
+        (0b11111110, 8, 8),
+    };
+
+    private static readonly (int Code, int CodeLength, int DifferentialLength)[] V3LumaDcTable =
+    {
+        (0b00, 2, 1),
+        (0b01, 2, 2),
+        (0b100, 3, 0),
+        (0b101, 3, 3),
+        (0b110, 3, 4),
+        (0b1110, 4, 5),
+        (0b11110, 5, 6),
+        (0b111110, 6, 7),
+        (0b1111110, 7, 8),
+    };
 
     // PERF: binary trie over the AC VLC codes (plus EOB/escape), built once from AcVlcTable — the
     // same codes, same bit strings, just addressed as an int-indexed tree instead of a per-bit
@@ -471,14 +498,10 @@ public sealed class MdecCore
     // is the full demuxed BS frame (8-byte header included, exactly as the St ring hands frames to
     // the game and as this slice's FmvDecode harness feeds it straight through).
     //
-    // BS v2 8-byte header, confirmed against real frames (data/disk-1/FMV1/FMV000.STR, frames
-    // 1/2/3/30/75/150, 2026-08-29): u16 length (an MDEC-code-count hint used for buffer sizing on
-    // console; not needed by this decoder, which self-terminates on MacroblockCount), u16 magic
-    // (always 0x3800), u16 qscale (constant for the whole frame in v2 — confirmed: real hardware
-    // /jPSXdec both read it once per frame, not per block/macroblock), u16 version (always 2 for
-    // every frame sampled). DIVERGENCE FROM THE PLAN: the plan's discovery note describes a 16-byte
-    // header; the real data has an 8-byte header (these 4 fields only) — bytes 8+ are already the
-    // entropy-coded bitstream, confirmed by decoding starting there matching MacroblockCount.
+    // BS v2/v3 8-byte header, confirmed against real PE v2 and DBZ BANDAI v3 frames: u16 length (an
+    // MDEC-code-count hint used for buffer sizing on console), u16 magic 0x3800, u16 frame qscale,
+    // and u16 version. Bytes 8+ are the entropy-coded bitstream. Version 2 stores absolute 10-bit
+    // DC values; version 3 uses the standard differential DC tables below.
     public ushort[] VlcDecode(byte[] frameData, out int macroblocksDecoded, out string error)
     {
         macroblocksDecoded = 0;
@@ -501,16 +524,17 @@ public sealed class MdecCore
             return null;
         }
 
-        if (version != 2)
+        if (version != 2 && version != 3)
         {
-            // PARTIAL: only v2 (no DC prediction) is implemented, matching every frame this port's
-            // 47 FMV1 movies use. v3 (DC prediction across blocks) is out of scope for this slice.
-            error = $"unsupported BS version {version} (only v2 is implemented)";
+            error = $"unsupported BS version {version} (only v2 and v3 are implemented)";
             return null;
         }
 
         var reader = new BitReader(frameData, 8);
         var output = new List<ushort>();
+        int previousCrDc = 0;
+        int previousCbDc = 0;
+        int previousYDc = 0;
 
         // Macroblock scan order: column-major (confirmed against jPSXdec's ParsedMdecImage.java
         // during this slice's discovery: outer loop over X/columns, inner loop over Y/rows) — this
@@ -521,11 +545,12 @@ public sealed class MdecCore
             for (int row = 0; row < MacroblockRows; row++)
             {
                 // Block order within a macroblock: Cr, Cb, Y1(TL), Y2(TR), Y3(BL), Y4(BR).
-                for (int b = 0; b < 6; b++)
+                for (int blockIndex = 0; blockIndex < 6; blockIndex++)
                 {
-                    if (!DecodeBlockToRle(reader, qscale, output))
+                    if (!DecodeBlockToRle(reader, qscale, version, blockIndex,
+                            ref previousCrDc, ref previousCbDc, ref previousYDc, output))
                     {
-                        error = $"VLC decode failed at macroblock (col={col},row={row}) block {b}, " +
+                        error = $"VLC decode failed at macroblock (col={col},row={row}) block {blockIndex}, " +
                                 $"after {output.Count} RLE words (header length hint was {length})";
                         macroblocksDecoded = col * MacroblockRows + row;
                         return null;
@@ -534,7 +559,7 @@ public sealed class MdecCore
                     if (_vlcMaxWords > 0 && output.Count > _vlcMaxWords)
                     {
                         error = $"VLC output exceeded DecDCTvlcSize cap ({_vlcMaxWords} words) at " +
-                                $"macroblock (col={col},row={row}) block {b}";
+                            $"macroblock (col={col},row={row}) block {blockIndex}";
                         macroblocksDecoded = col * MacroblockRows + row;
                         return null;
                     }
@@ -565,16 +590,52 @@ public sealed class MdecCore
         return output.ToArray();
     }
 
-    // One block: DC (10-bit signed absolute value, v2 — no prediction) then AC run/level pairs
+    // One block: DC (10-bit signed absolute value for v2, differential Huffman value for v3) then
+    // AC run/level pairs
     // (MPEG-1 table zero VLC, PSX 6-bit-run/10-bit-level escape, "10" end-of-block), each coefficient
     // packed into the same 16-bit MdecCode wire format DecDCTin consumes: bits 15-10 = run (DC word:
     // qscale, per the real chip's own convention — see LibPress.DecDCTin's header note), bits 9-0 =
     // value (two's complement). Block is terminated in the output list with the sentinel 0xFE00
     // (top6=0x3F, bottom10=0x200) — the well-established PSX MDEC end-of-block marker value.
-    private bool DecodeBlockToRle(BitReader reader, int qscale, List<ushort> output)
+    private bool DecodeBlockToRle(BitReader reader, int qscale, int version, int blockIndex,
+        ref int previousCrDc, ref int previousCbDc, ref int previousYDc, List<ushort> output)
     {
-        int dc = reader.ReadSigned(10);
-        if (reader.Overrun) return false;
+        int dc;
+        if (version == 2)
+        {
+            dc = reader.ReadSigned(10);
+            if (reader.Overrun) return false;
+        }
+        else
+        {
+            bool chroma = blockIndex < 2;
+            if (!TryReadV3DcDifference(reader, chroma, out int difference))
+            {
+                return false;
+            }
+
+            if (blockIndex == 0)
+            {
+                previousCrDc += difference;
+                dc = previousCrDc;
+            }
+            else if (blockIndex == 1)
+            {
+                previousCbDc += difference;
+                dc = previousCbDc;
+            }
+            else
+            {
+                previousYDc += difference;
+                dc = previousYDc;
+            }
+
+            if (dc < -512 || dc > 511)
+            {
+                return false;
+            }
+        }
+
         output.Add((ushort)(((qscale & 0x3F) << 10) | (dc & 0x3FF)));
 
         while (true)
@@ -629,6 +690,56 @@ public sealed class MdecCore
                 }
             }
         }
+    }
+
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: standard STR v3 DC Huffman expansion performed by the software VLC stage before
+    // the resulting qscale/DC word is sent to MDEC. The differential is shifted from 8-bit to
+    // 10-bit precision exactly as specified by the STR format.
+    private static bool TryReadV3DcDifference(BitReader reader, bool chroma, out int difference)
+    {
+        difference = 0;
+        var table = chroma ? V3ChromaDcTable : V3LumaDcTable;
+        int maxCodeLength = chroma ? 8 : 7;
+        int code = 0;
+
+        for (int codeLength = 1; codeLength <= maxCodeLength; codeLength++)
+        {
+            code = (code << 1) | reader.ReadBit();
+            if (reader.Overrun)
+            {
+                return false;
+            }
+
+            for (int tableIndex = 0; tableIndex < table.Length; tableIndex++)
+            {
+                var entry = table[tableIndex];
+                if (entry.CodeLength != codeLength || entry.Code != code)
+                {
+                    continue;
+                }
+
+                if (entry.DifferentialLength == 0)
+                {
+                    return true;
+                }
+
+                int encoded = reader.ReadBits(entry.DifferentialLength);
+                if (reader.Overrun)
+                {
+                    return false;
+                }
+
+                int signBit = 1 << (entry.DifferentialLength - 1);
+                int differential = (encoded & signBit) == 0
+                    ? encoded - ((1 << entry.DifferentialLength) - 1)
+                    : encoded;
+                difference = differential * 4;
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // GHIDRA: DecDCTin @ 0x8010BFA0

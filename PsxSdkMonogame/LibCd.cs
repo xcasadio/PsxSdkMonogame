@@ -4,6 +4,10 @@ namespace PsxSdkMonogame;
 
 public static class LibCd
 {
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: desktop latch for the CdlSeekL position consumed by the following CdRead2 call.
+    private static CdlLOC s_lastSeekTarget;
+
     public class CdlLOC
     {
         public byte minute;
@@ -152,14 +156,50 @@ public static class LibCd
 
     public static int CdControl(byte com, byte[] param, byte[] result)
     {
-        /* Do nothing */
-        return default;
+        if (com == 0x15 && param != null && param.Length >= 3)
+        {
+            s_lastSeekTarget = new CdlLOC
+            {
+                minute = param[0],
+                second = param[1],
+                sector = param[2],
+                track = param.Length > 3 ? param[3] : (byte)0,
+            };
+            return 1;
+        }
+
+        return 0;
+    }
+
+    // JUSTIFICATION: C# language bridge only
+    // RELATION: typed form of CdControl(CdlSeekL, CdlLOC*, result).
+    public static int CdControl(byte com, CdlLOC param, byte[] result)
+    {
+        if (com != 0x15 || param == null)
+        {
+            return 0;
+        }
+
+        s_lastSeekTarget = new CdlLOC
+        {
+            minute = param.minute,
+            second = param.second,
+            sector = param.sector,
+            track = param.track,
+        };
+        return 1;
     }
 
     public static int CdControlB(byte com, byte[] param, byte[] result)
     {
-        /* Do nothing */
-        return default;
+        if (com == 9)
+        {
+            LibDs.CurrentStreamSource?.Dispose();
+            LibDs.CurrentStreamSource = null;
+            return 1;
+        }
+
+        return 0;
     }
 
     public static int CdControlF(byte com, byte[] param)
@@ -217,8 +257,39 @@ public static class LibCd
 
     public static CdlFILE CdSearchFile(CdlFILE fp, char name)
     {
-        /* Do nothing */
-        return default;
+        return CdSearchFile(fp, new[] { name });
+    }
+
+    // JUSTIFICATION: C# language bridge only
+    // RELATION: array-backed representation of the original null-terminated char* filename.
+    public static CdlFILE CdSearchFile(CdlFILE fp, char[] name)
+    {
+        if (fp == null || name == null)
+        {
+            return null;
+        }
+
+        var dsFile = new LibDs.DslFILE();
+        if (LibDs.DsSearchFile(dsFile, name) == null)
+        {
+            return null;
+        }
+
+        fp.pos ??= new CdlLOC();
+        fp.pos.minute = dsFile.pos.minute;
+        fp.pos.second = dsFile.pos.second;
+        fp.pos.sector = dsFile.pos.sector;
+        fp.pos.track = dsFile.pos.track;
+        fp.size = checked((int)dsFile.size);
+
+        int copyLength = Math.Min(name.Length, fp.name.Length);
+        Array.Copy(name, fp.name, copyLength);
+        for (int i = copyLength; i < fp.name.Length; i++)
+        {
+            fp.name[i] = '\0';
+        }
+
+        return fp;
     }
 
     public static int CdRead(int sectors, ulong[] buf, int mode)
@@ -241,8 +312,19 @@ public static class LibCd
 
     public static int CdRead2(long mode)
     {
-        /* Do nothing */
-        return default;
+        if (s_lastSeekTarget == null)
+        {
+            return 0;
+        }
+
+        var position = new LibDs.DslLOC
+        {
+            minute = s_lastSeekTarget.minute,
+            second = s_lastSeekTarget.second,
+            sector = s_lastSeekTarget.sector,
+            track = s_lastSeekTarget.track,
+        };
+        return LibDs.DsRead2(position, checked((int)mode));
     }
 
     // ---------------------------------------------------------------------------------------
@@ -361,6 +443,13 @@ public static class LibCd
         s_maskValue = mask;
         s_maskStart = start;
         s_maskEnd = end;
+    }
+
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: deferred St CD interrupt work is unnecessary because desktop sector ingest runs
+    // synchronously inside StGetNext. The game callback retains the original conditional call.
+    public static void StCdInterrupt()
+    {
     }
 
     // JUSTIFICATION: desktop adaptation — copies one already-classified VIDEO sector's 32-byte

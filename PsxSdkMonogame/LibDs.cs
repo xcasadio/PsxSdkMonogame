@@ -14,29 +14,41 @@ public static class LibDs
 
     // JUSTIFICATION: desktop adaptation — a raw-sector reader positioned on an already-open disc
     // file, wired up by DsRead2 when it's asked for streaming mode (mode & 0x100) and consumed by
-    // LibCd.StGetNext's synchronous ingest. One raw sector is 2336 bytes (8-byte XA subheader +
-    // 2048 data + 280 EDC/ECC), matching the RAW dumps this repo's data/disk-*/FMV*/*.STR files
-    // are stored as (calibrated against data/disk-1/FMV1/FMV000.STR, 2026-08-29).
+    // LibCd.StGetNext's synchronous ingest. The exposed sector is always the existing 2336-byte
+    // contract (8-byte XA subheader + data + EDC/ECC). Sources may use that layout directly or a
+    // complete 2352-byte raw sector, in which case the 16-byte sync/MSF/mode prefix is removed.
     public sealed class DsStreamSource : IDisposable
     {
         private readonly FileStream _stream;
+        private readonly int _sourceSectorSize;
         private int _nextAbsoluteSector;
 
         public DsStreamSource(FileStream stream, int startAbsoluteSector)
+            : this(stream, startAbsoluteSector, 2336)
         {
+        }
+
+        public DsStreamSource(FileStream stream, int startAbsoluteSector, int sourceSectorSize)
+        {
+            if (sourceSectorSize != 2336 && sourceSectorSize != 2352)
+            {
+                throw new ArgumentOutOfRangeException(nameof(sourceSectorSize));
+            }
+
             _stream = stream;
             _nextAbsoluteSector = startAbsoluteSector;
+            _sourceSectorSize = sourceSectorSize;
         }
 
         public bool TryReadNextSector(out byte[] sector, out int absoluteSector)
         {
-            sector = new byte[2336];
+            byte[] sourceSector = new byte[_sourceSectorSize];
             absoluteSector = _nextAbsoluteSector;
 
             int totalRead = 0;
-            while (totalRead < 2336)
+            while (totalRead < sourceSector.Length)
             {
-                int n = _stream.Read(sector, totalRead, 2336 - totalRead);
+                int n = _stream.Read(sourceSector, totalRead, sourceSector.Length - totalRead);
                 if (n <= 0)
                 {
                     sector = null;
@@ -45,6 +57,18 @@ public static class LibDs
                 }
 
                 totalRead += n;
+            }
+
+            if (_sourceSectorSize == 2352)
+            {
+                // Full raw sectors prepend the 12-byte sync and 4-byte MSF/mode header. The rest
+                // is the same 2336-byte subheader/data/EDC layout consumed by LibCd and XaAudio.
+                sector = new byte[2336];
+                Array.Copy(sourceSector, 16, sector, 0, sector.Length);
+            }
+            else
+            {
+                sector = sourceSector;
             }
 
             _nextAbsoluteSector++;
@@ -70,6 +94,7 @@ public static class LibDs
         public string HostPath;
         public int BaseLba;
         public int SectorCount;
+        public int SectorSize;
     }
 
     private static readonly Dictionary<string, FileRegistration> s_registry =
@@ -107,7 +132,8 @@ public static class LibDs
         }
 
         long lengthBytes = new FileInfo(hostPath).Length;
-        int sectorCount = (int)(lengthBytes / 2336);
+        int sectorSize = DetectRawSectorSize(hostPath, lengthBytes);
+        int sectorCount = checked((int)(lengthBytes / sectorSize));
 
         int baseLba = s_nextBaseLba;
         int endLba = baseLba + sectorCount - 1;
@@ -119,10 +145,55 @@ public static class LibDs
                 $"{sectorCount} sectors.");
         }
 
-        var reg = new FileRegistration { HostPath = hostPath, BaseLba = baseLba, SectorCount = sectorCount };
+        var reg = new FileRegistration
+        {
+            HostPath = hostPath,
+            BaseLba = baseLba,
+            SectorCount = sectorCount,
+            SectorSize = sectorSize,
+        };
         s_registry[isoPath] = reg;
         s_nextBaseLba = baseLba + sectorCount + 32;
         return reg;
+    }
+
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: recognizes the two raw-sector dump layouts accepted by DsStreamSource. A 2352-byte
+    // sector is selected only when the standard 12-byte sync marker and mode-2 byte are present;
+    // otherwise the pre-existing 2336-byte layout must divide the file exactly.
+    private static int DetectRawSectorSize(string hostPath, long lengthBytes)
+    {
+        if (lengthBytes % 2352 == 0)
+        {
+            byte[] header = new byte[16];
+            using var stream = new FileStream(hostPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            if (stream.Read(header, 0, header.Length) == header.Length &&
+                header[0] == 0 && header[11] == 0 && header[15] == 2)
+            {
+                bool sync = true;
+                for (int i = 1; i < 11; i++)
+                {
+                    if (header[i] != 0xff)
+                    {
+                        sync = false;
+                        break;
+                    }
+                }
+
+                if (sync)
+                {
+                    return 2352;
+                }
+            }
+        }
+
+        if (lengthBytes % 2336 == 0)
+        {
+            return 2336;
+        }
+
+        throw new InvalidDataException(
+            $"LibDs: '{hostPath}' is neither a complete 2352-byte-sector dump nor a 2336-byte-sector stream.");
     }
 
     private static FileRegistration FindRegistrationContaining(int lba)
@@ -406,11 +477,11 @@ public static class LibDs
             return 0;
         }
 
-        long byteOffset = (long)(lba - reg.BaseLba) * 2336;
+        long byteOffset = (long)(lba - reg.BaseLba) * reg.SectorSize;
         stream.Seek(byteOffset, SeekOrigin.Begin);
 
         CurrentStreamSource?.Dispose();
-        CurrentStreamSource = new DsStreamSource(stream, lba);
+        CurrentStreamSource = new DsStreamSource(stream, lba, reg.SectorSize);
         return 1;
     }
 
