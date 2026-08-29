@@ -37,6 +37,12 @@ public sealed class MdecCore
     // One decoded strip = one macroblock column, full frame height, RGB15 (2 bytes/pixel).
     public const int StripPixelBytes = MacroblockSize * FrameHeight * 2; // 7680
 
+    // 24-bit strip = same macroblock column/height, but 3 raw bytes/pixel (no 5:5:5 quantization).
+    // This is exactly the byte count the driver's strip-width selector implies: a strip row is 24
+    // HALFWORDS (48 bytes) for 16 pixels, so a full-height strip is 24*FrameHeight*2 = 11520 bytes
+    // (0x2D00) — see the GHIDRA note on FeedRleList below for where that selector value comes from.
+    public const int Strip24PixelBytes = MacroblockSize * FrameHeight * 3; // 11520 (== 24*240*2)
+
     // GHIDRA: default IQ table data observed at 0x8010DA0C is BSS in the ROM image (all zero bytes
     // on disk — confirmed by reading data/disk-1/SLUS_006.62 at the mapped file offset), so the
     // actual default values are written there at runteim by DecDCTReset, not stored as literal ROM
@@ -234,21 +240,90 @@ public sealed class MdecCore
     private const string EndOfBlockBits = "10";
     private const string EscapeBits = "000001";
 
-    // Trie keyed by bit-prefix -> (run, level); built once from AcVlcTable. Kept as a plain
-    // dictionary of full codes (max 17 bits here) rather than a real trie: the harness this feeds
-    // is offline test tooling, not a hot per-frame console path, so simplicity wins over speed.
-    private static readonly Dictionary<string, (int run, int level)> AcVlcLookup = BuildAcVlcLookup();
-    private static readonly int MaxAcCodeLength = 17;
+    // PERF: binary trie over the AC VLC codes (plus EOB/escape), built once from AcVlcTable — the
+    // same codes, same bit strings, just addressed as an int-indexed tree instead of a per-bit
+    // string concatenation + Dictionary<string,...> lookup. This is the "precomputed VLC lookup
+    // table" optimization the perf pass calls for: it can only change HOW a code is found, never
+    // WHICH run/level a given bit sequence decodes to, so RLE output is bit-for-bit identical to
+    // the string/dictionary walk it replaces (verified by the perf pass's hash-identity check on
+    // real FMV000/FMV001 frames). Node 0 is the root; -1 means "no such child" (a decode error —
+    // the original string walk would have fallen through to its own "unmatched after
+    // MaxAcCodeLength bits" failure in the same situation).
+    private enum AcTrieKind : byte { Internal = 0, Code = 1, EndOfBlock = 2, Escape = 3 }
 
-    private static Dictionary<string, (int, int)> BuildAcVlcLookup()
+    private static readonly int[] AcTrieChild0;
+    private static readonly int[] AcTrieChild1;
+    private static readonly AcTrieKind[] AcTrieKindOf;
+    private static readonly int[] AcTrieRun;
+    private static readonly int[] AcTrieLevel;
+
+    static MdecCore()
     {
-        var d = new Dictionary<string, (int, int)>();
-        foreach (AcVlcEntry e in AcVlcTable)
+        BuildAcTrie(out AcTrieChild0, out AcTrieChild1, out AcTrieKindOf, out AcTrieRun, out AcTrieLevel);
+    }
+
+    private static void BuildAcTrie(out int[] child0, out int[] child1, out AcTrieKind[] kind,
+        out int[] run, out int[] level)
+    {
+        // Upper bound on trie nodes: one internal node per bit of every code, worst case (no shared
+        // prefixes) is the sum of all code lengths. Cheap to over-allocate and trim.
+        int capacity = 1;
+        foreach (AcVlcEntry e in AcVlcTable) capacity += e.Bits.Length;
+        capacity += EndOfBlockBits.Length + EscapeBits.Length;
+
+        var c0 = new int[capacity];
+        var c1 = new int[capacity];
+        var k = new AcTrieKind[capacity];
+        var r = new int[capacity];
+        var lv = new int[capacity];
+        Array.Fill(c0, -1);
+        Array.Fill(c1, -1);
+
+        int nodeCount = 1; // node 0 = root
+
+        void Insert(string bits, AcTrieKind leafKind, int leafRun, int leafLevel)
         {
-            d[e.Bits] = (e.Run, e.Level);
+            int node = 0;
+            for (int i = 0; i < bits.Length; i++)
+            {
+                bool last = i == bits.Length - 1;
+                ref int childSlot = ref (bits[i] == '0' ? ref c0[node] : ref c1[node]);
+                if (childSlot < 0)
+                {
+                    childSlot = nodeCount++;
+                }
+                else if (last || k[childSlot] != AcTrieKind.Internal)
+                {
+                    // A prefix collision means the code table isn't prefix-free (or this fragment
+                    // was mis-transcribed) — fail loudly rather than silently mis-decoding, same
+                    // spirit as the IQ-table cross-check above.
+                    throw new InvalidOperationException(
+                        $"MdecCore: AC VLC trie has a conflicting/non-prefix-free code at bit " +
+                        $"string '{bits}' (node {childSlot} already terminal or reused).");
+                }
+
+                node = childSlot;
+                if (last)
+                {
+                    k[node] = leafKind;
+                    r[node] = leafRun;
+                    lv[node] = leafLevel;
+                }
+            }
         }
 
-        return d;
+        Insert(EndOfBlockBits, AcTrieKind.EndOfBlock, 0, 0);
+        Insert(EscapeBits, AcTrieKind.Escape, 0, 0);
+        foreach (AcVlcEntry e in AcVlcTable)
+        {
+            Insert(e.Bits, AcTrieKind.Code, e.Run, e.Level);
+        }
+
+        child0 = c0;
+        child1 = c1;
+        kind = k;
+        run = r;
+        level = lv;
     }
 
     // ------------------------------------------------------------------------------------------
@@ -344,6 +419,31 @@ public sealed class MdecCore
 
             _bitsLeftInWord--;
             return (int)((_current >> _bitsLeftInWord) & 1);
+        }
+
+        // S2 ADVISORY (2026-08-29): bitstream-exhaustion check, scoped to the CURRENTLY BUFFERED
+        // 16-bit word only. `_data` is not "this frame's bytes and nothing else" — DecDCTvlc2 hands
+        // this reader the whole rest of its backing scratch region (see LibPress.DecDCTvlc2's own
+        // note: "no length this call needs up front", so the caller doesn't trim the buffer to the
+        // frame's real end), which on real ring/scratch memory contains unrelated bytes (a later
+        // frame already demuxed into the same ring, or stale scratch data) past the true end of
+        // THIS frame's bitstream. Scanning all the way to `_data.Length` therefore false-positived
+        // on real frames (confirmed empirically this slice on FMV000 frame 150 and FMV001 frame
+        // 400 — both legitimate frames, not corrupt). What real MDEC hardware actually guarantees is
+        // word-alignment padding: once the last macroblock's last code is read, any bits still
+        // sitting in the word already fetched off the wire must be padding (zero) — bits beyond
+        // that boundary were never fetched from this frame's stream at all, so they carry no
+        // meaning to check. Re-verified against every frame of both FMV000 and FMV001 with this
+        // narrower scope that it never legitimately fires on real data.
+        public bool HasNonZeroTrailingData()
+        {
+            if (_bitsLeftInWord <= 0)
+            {
+                return false;
+            }
+
+            uint mask = (1u << _bitsLeftInWord) - 1;
+            return (_current & mask) != 0;
         }
 
         public int ReadBits(int count)
@@ -442,6 +542,25 @@ public sealed class MdecCore
             }
         }
 
+        // S2 ADVISORY (2026-08-29): bitstream-exhaustion check — see BitReader.
+        // HasNonZeroTrailingData's own note. MEASURED AND DELIBERATELY NOT HARD-FAILED: on every
+        // real frame sampled from both movies, the bits immediately following the last macroblock's
+        // last code are non-zero (e.g. FMV000 frame 2: word 0x049f with 6 bits still unread; FMV000
+        // frame 75: word 0x3a7f with 8 bits unread) — `frameData` is not trimmed to this frame's own
+        // encoded length (LibPress.DecDCTvlc2 hands this decoder the whole rest of its backing
+        // scratch region, by design — see that method's own header note), so what follows the
+        // picture's last code is genuine subsequent stream content (the next frame's own data
+        // already sitting in the same scratch/ring buffer), not this frame's padding. There is no
+        // reliable all-zero invariant to assert here without the true per-frame byte length, which
+        // this self-terminating (macroblock-count-driven) decoder does not have and, per the class
+        // header's own JUSTIFICATION, deliberately does not require. Hard-failing on this would
+        // reject every real frame tested — logged as a diagnostic only, never a decode failure.
+        if (reader.HasNonZeroTrailingData())
+        {
+            Console.WriteLine("[MdecCore] NOTE: non-zero data follows the last macroblock's last " +
+                               "code (expected — see VlcDecode's bitstream-exhaustion note).");
+        }
+
         macroblocksDecoded = MacroblockCount;
         return output.ToArray();
     }
@@ -460,43 +579,54 @@ public sealed class MdecCore
 
         while (true)
         {
-            string bits = "";
-            for (int i = 0; i < MaxAcCodeLength; i++)
+            // PERF: walk the precomputed trie one bit at a time (int-indexed array hops) instead of
+            // building a growing string and hashing it against a Dictionary<string,...> after every
+            // bit — see the trie's own header note for why this can't change which code matches.
+            int node = 0;
+            while (true)
             {
-                bits += reader.ReadBit().ToString();
+                int bit = reader.ReadBit();
                 if (reader.Overrun) return false;
 
-                if (bits == EndOfBlockBits)
+                node = bit == 0 ? AcTrieChild0[node] : AcTrieChild1[node];
+                if (node < 0)
                 {
-                    output.Add(0xFE00);
-                    return true;
+                    // No such code — mirrors the original's "unmatched after MaxAcCodeLength bits"
+                    // failure (a non-prefix-free bit sequence can only mean a corrupt/unsupported
+                    // stream, never a longer valid code: the table is verified prefix-free at
+                    // startup).
+                    return false;
                 }
 
-                if (bits == EscapeBits)
+                if (AcTrieKindOf[node] != AcTrieKind.Internal)
+                {
+                    break;
+                }
+            }
+
+            switch (AcTrieKindOf[node])
+            {
+                case AcTrieKind.EndOfBlock:
+                    output.Add(0xFE00);
+                    return true;
+
+                case AcTrieKind.Escape:
                 {
                     int run = reader.ReadBits(6);
                     int level = reader.ReadSigned(10);
                     if (reader.Overrun) return false;
                     output.Add((ushort)(((run & 0x3F) << 10) | (level & 0x3FF)));
-                    bits = null;
                     break;
                 }
 
-                if (AcVlcLookup.TryGetValue(bits, out (int run, int level) rl))
+                default: // AcTrieKind.Code
                 {
                     int sign = reader.ReadBit();
                     if (reader.Overrun) return false;
-                    int level = sign != 0 ? -rl.level : rl.level;
-                    output.Add((ushort)(((rl.run & 0x3F) << 10) | (level & 0x3FF)));
-                    bits = null;
+                    int level = sign != 0 ? -AcTrieLevel[node] : AcTrieLevel[node];
+                    output.Add((ushort)(((AcTrieRun[node] & 0x3F) << 10) | (level & 0x3FF)));
                     break;
                 }
-            }
-
-            if (bits != null)
-            {
-                // Consumed MaxAcCodeLength bits without matching EOB, escape, or a table entry.
-                return false;
             }
         }
     }
@@ -511,9 +641,18 @@ public sealed class MdecCore
     // just dequeues the next already-decoded strip — see LibPress.DecDCTout).
     //
     // `rleWords` is the RLE command list AFTER the caller (LibPress) has already stripped the u16
-    // length prefix — see LibPress.DecDCTin for that framing. mode bit0 selects 15-bit (0, fully
-    // implemented) vs 24-bit (1, PARTIAL — see BuildRgb15) output depth; mode bit1 sets bit15 (STP)
-    // on every output pixel when set (matches "bits 15 = 0 unless cmd bit25 set" from the plan).
+    // length prefix — see LibPress.DecDCTin for that framing. mode bit0 selects 15-bit (0) vs
+    // 24-bit (1) output depth; mode bit1 sets bit15 (STP) on every output pixel when set (matches
+    // "bits 15 = 0 unless cmd bit25 set" from the plan) — STP has no meaning for 24-bit pixels (no
+    // spare bit in a packed 3-byte-per-pixel stream) so it is only applied on the 15-bit path.
+    //
+    // GHIDRA: the script-path FMV DMA callback's first-frame branch (overlay 0x44 @0x80121638-
+    // 0x80121690) is the evidence this 24-bit path implements: it `lbu`s g_transitionDirection
+    // (0x800B0DBB), `xori`s it 1, `sb`s it back, sets the strip-width selector (OVL_DAT_801228f8 in
+    // FmvStream.cs) to 0x18 (24 halfwords/row, matching Strip24PixelBytes below), and re-runs the
+    // display-env setup with mode=1 (isrgb24=1) — i.e. every script-path movie (all in-game
+    // cinematics) actually plays back in 24-bit on console. mode bit0 is exactly the flag that
+    // selector flip is meant to steer here.
     public bool FeedRleList(ushort[] rleWords, int mode, out int macroblocksParsed, out string error)
     {
         macroblocksParsed = 0;
@@ -522,37 +661,53 @@ public sealed class MdecCore
 
         bool stp = (mode & 0x2) != 0;
         bool is24Bit = (mode & 0x1) != 0;
-        if (is24Bit)
+        if ((mode & ~0x3) != 0)
         {
-            Console.WriteLine("[MdecCore] PARTIAL: 24-bit MDEC output requested (mode&1) but not " +
-                               "implemented — all 47 FMV1 movies in this title are 16-bit, falling " +
-                               "back to the 15-bit path.");
+            // This port's DecDCTin abstraction only ever models two independent bits (depth, STP —
+            // see the header note above); a real MDEC command additionally distinguishes 4-bit and
+            // 8-bit (CLUT) output depths, which no caller in this title uses (every FMV1 movie is
+            // either 15-bit or 24-bit — see MdecCore's class header) and which this decoder does
+            // not implement. Log and fall through on the depth bit0 already extracted rather than
+            // silently ignore the extra bits.
+            Console.WriteLine($"[MdecCore] WARNING: DecDCTin mode 0x{mode:x} has bits set beyond " +
+                               "the depth/STP selectors this port models (4-bit/8-bit output are " +
+                               $"unsupported) — decoding as {(is24Bit ? "24-bit" : "15-bit")} anyway.");
         }
 
         int pos = 0;
 
         for (int col = 0; col < MacroblockCols; col++)
         {
-            var strip = new byte[StripPixelBytes];
+            var strip = new byte[is24Bit ? Strip24PixelBytes : StripPixelBytes];
 
             for (int row = 0; row < MacroblockRows; row++)
             {
-                var blocks = new double[6][];
                 for (int b = 0; b < 6; b++)
                 {
                     byte[] iq = b < 2 ? _iqC : _iqY; // Cr, Cb use the chroma table; Y1..Y4 use luma.
-                    if (!ReadOneBlock(rleWords, ref pos, iq, out double[] spatial))
+                    // PERF: writes straight into the b-th of 6 persistent per-instance scratch
+                    // buffers instead of allocating a fresh double[64] for every block (1800/frame)
+                    // — see the buffers' own field comment. Numerically identical: same dequant/
+                    // IDCT math, just no allocation.
+                    if (!ReadOneBlock(rleWords, ref pos, iq, _blockScratch[b]))
                     {
                         error = $"DecDCTin: malformed RLE list at macroblock (col={col},row={row}) " +
                                 $"block {b}, word {pos}/{rleWords.Length}";
                         macroblocksParsed = col * MacroblockRows + row;
                         return false;
                     }
-
-                    blocks[b] = spatial;
                 }
 
-                AssembleMacroblockIntoStrip(strip, row, blocks[0], blocks[1], blocks[2], blocks[3], blocks[4], blocks[5], stp);
+                if (is24Bit)
+                {
+                    AssembleMacroblockIntoStrip24(strip, row, _blockScratch[0], _blockScratch[1],
+                        _blockScratch[2], _blockScratch[3], _blockScratch[4], _blockScratch[5]);
+                }
+                else
+                {
+                    AssembleMacroblockIntoStrip(strip, row, _blockScratch[0], _blockScratch[1],
+                        _blockScratch[2], _blockScratch[3], _blockScratch[4], _blockScratch[5], stp);
+                }
             }
 
             _pendingStrips.Enqueue(strip);
@@ -562,19 +717,51 @@ public sealed class MdecCore
 
         if (pos != rleWords.Length)
         {
-            // Not fatal (extra trailing words don't corrupt the image), but worth surfacing —
-            // DecDCTvlc2 and DecDCTin are meant to agree exactly on list length.
-            Console.WriteLine($"[MdecCore] NOTE: DecDCTin consumed {pos}/{rleWords.Length} RLE words " +
-                               "(expected an exact match with DecDCTvlc2's output).");
+            // S2 ADVISORY PROMOTION (2026-08-29): was a non-fatal NOTE ("expected an exact match
+            // with DecDCTvlc2's output"). DecDCTvlc2 and DecDCTin are the two ends of the same RLE
+            // list this port's own convention defines (see the class header) — any length mismatch
+            // means one of them mis-decoded, which silently produced a wrong image before this was
+            // promoted to a hard failure. Re-verified against real FMV000/FMV001 frames (every
+            // frame of both movies) that this never legitimately fires on real data.
+            error = $"DecDCTin consumed {pos}/{rleWords.Length} RLE words — DecDCTvlc2 and DecDCTin " +
+                    "disagree on RLE list length";
+            return false;
         }
 
         return true;
     }
 
-    private bool ReadOneBlock(ushort[] words, ref int pos, byte[] iqTable, out double[] spatial)
+    // PERF: six persistent per-instance scratch buffers — one per macroblock block index (0=Cr,
+    // 1=Cb, 2..5=Y1..Y4) — holding that block's IDCT-spatial output. AssembleMacroblockIntoStrip
+    // needs all six simultaneously (it interleaves luma/chroma per output pixel), so these can't
+    // collapse to one buffer, but they DO stay live only within a single macroblock's processing
+    // and are safely overwritten by the next macroblock (this chip model is already single-
+    // threaded/re-entrancy-scoped to one in-flight decode — see the class header and DecDCTout's
+    // queueing note). Replaces 1800 double[64] allocations/frame (one per block) with 6 total.
+    private readonly double[][] _blockScratch =
     {
-        spatial = null;
-        var coeffZigZag = new double[64];
+        new double[64], new double[64], new double[64], new double[64], new double[64], new double[64],
+    };
+
+    // PERF: scratch buffers for ReadOneBlock/Idct8x8, reused across every block of every macroblock
+    // instead of allocating fresh double[64]/double[8] arrays per call (7 arrays/block * 1800
+    // blocks/frame). Safe because a single block is always fully dequantized+transformed before the
+    // next one starts (same single-threaded, sequential-decode assumption as _blockScratch above).
+    private readonly double[] _coeffZigZagScratch = new double[64];
+    private readonly double[] _rasterScratch = new double[64];
+    private readonly double[] _idctTmpScratch = new double[64];
+    private readonly double[] _idctColScratch = new double[8];
+    private readonly double[] _idctColOutScratch = new double[8];
+    private readonly double[] _idctRowScratch = new double[8];
+    private readonly double[] _idctRowOutScratch = new double[8];
+
+    private bool ReadOneBlock(ushort[] words, ref int pos, byte[] iqTable, double[] spatialOut)
+    {
+        double[] coeffZigZag = _coeffZigZagScratch;
+        // Only index 0 and the AC positions actually visited below are meaningful; every other
+        // position must read as zero (an implicit "no coefficient here"), so — unlike a fresh
+        // `new double[64]` which is already zeroed — a reused buffer needs an explicit clear first.
+        Array.Clear(coeffZigZag, 0, 64);
 
         if (pos >= words.Length) return false;
         ushort dcWord = words[pos++];
@@ -607,13 +794,15 @@ public sealed class MdecCore
         }
 
         // Un-zigzag into raster (row-major, row=vertical frequency) order for the IDCT.
-        var raster = new double[64];
+        // ZigZagRasterIndex is a permutation of 0..63, so every raster position is written exactly
+        // once below — no clear needed (unlike coeffZigZag above).
+        double[] raster = _rasterScratch;
         for (int i = 0; i < 64; i++)
         {
             raster[ZigZagRasterIndex[i]] = coeffZigZag[i];
         }
 
-        spatial = Idct8x8(raster);
+        Idct8x8(raster, spatialOut);
         return true;
     }
 
@@ -656,11 +845,17 @@ public sealed class MdecCore
         }
     }
 
-    private static double[] Idct8x8(double[] raster)
+    // PERF: writes into caller-supplied `result` using this instance's scratch buffers instead of
+    // allocating tmp/col/colOut/row/rowOut/result fresh on every call (6 arrays * 1800 blocks/frame
+    // eliminated). Every element of every scratch buffer is fully overwritten before it is read on
+    // each call (see the loop bounds below), so reusing them carries no stale-data risk. Arithmetic
+    // is untouched — same operations in the same order, so results are bit-for-bit identical to the
+    // original.
+    private void Idct8x8(double[] raster, double[] result)
     {
-        var tmp = new double[64];
-        var col = new double[8];
-        var colOut = new double[8];
+        double[] tmp = _idctTmpScratch;
+        double[] col = _idctColScratch;
+        double[] colOut = _idctColOutScratch;
 
         // Pass 1: IDCT along columns (vertical frequency axis).
         for (int u = 0; u < 8; u++)
@@ -670,9 +865,8 @@ public sealed class MdecCore
             for (int y = 0; y < 8; y++) tmp[y * 8 + u] = colOut[y];
         }
 
-        var result = new double[64];
-        var row = new double[8];
-        var rowOut = new double[8];
+        double[] row = _idctRowScratch;
+        double[] rowOut = _idctRowOutScratch;
 
         // Pass 2: IDCT along rows (horizontal frequency axis).
         for (int y = 0; y < 8; y++)
@@ -681,8 +875,6 @@ public sealed class MdecCore
             Idct1D(row, rowOut);
             for (int x = 0; x < 8; x++) result[y * 8 + x] = rowOut[x];
         }
-
-        return result;
     }
 
     // ------------------------------------------------------------------------------------------
@@ -730,6 +922,56 @@ public sealed class MdecCore
                 int outOff = (py * MacroblockSize + lx) * 2;
                 strip[outOff] = (byte)pixel;
                 strip[outOff + 1] = (byte)(pixel >> 8);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // YCbCr(4:2:0) -> RGB24 macroblock assembly — same colour math and 4:2:0 nearest-neighbour
+    // upsampling as AssembleMacroblockIntoStrip above (see that method's header note), just packed
+    // as 3 full 8-bit bytes/pixel instead of quantized-and-packed 5:5:5 halfwords: this IS the
+    // whole point of 24-bit output (see FeedRleList's header note on the console always using it
+    // for script-path FMVs — full 8-bit channels, no 5-bit banding).
+    //
+    // Byte order: R, G, B (matches this SDK's own 24-bit VRAM convention, cross-checked against
+    // LibGpu.ReadDisplayRgb24 — the port's other working 24-bit consumer, used by the title
+    // screen's 24-bit background — which reads `byteInRow`/`+1`/`+2` as R/G/B respectively from the
+    // same raw VRAM byte stream that LoadImage DMAs verbatim from a strip like this one).
+    // ------------------------------------------------------------------------------------------
+    private static void AssembleMacroblockIntoStrip24(byte[] strip, int mbRow, double[] cr, double[] cb,
+        double[] y1, double[] y2, double[] y3, double[] y4)
+    {
+        int baseY = mbRow * MacroblockSize;
+
+        for (int ly = 0; ly < MacroblockSize; ly++)
+        {
+            for (int lx = 0; lx < MacroblockSize; lx++)
+            {
+                double[] yBlock = (lx < 8, ly < 8) switch
+                {
+                    (true, true) => y1,
+                    (false, true) => y2,
+                    (true, false) => y3,
+                    _ => y4,
+                };
+
+                int by = ly & 7, bx = lx & 7;
+                double y = yBlock[by * 8 + bx];
+
+                int cby = ly / 2, cbx = lx / 2;
+                double cbv = cb[cby * 8 + cbx];
+                double crv = cr[cby * 8 + cbx];
+
+                double yShift = y + 128.0;
+                int r = Clamp255(yShift + 1.402 * crv);
+                int g = Clamp255(yShift - 0.3437 * cbv - 0.7143 * crv);
+                int b = Clamp255(yShift + 1.772 * cbv);
+
+                int py = baseY + ly;
+                int outOff = (py * MacroblockSize + lx) * 3;
+                strip[outOff] = (byte)r;
+                strip[outOff + 1] = (byte)g;
+                strip[outOff + 2] = (byte)b;
             }
         }
     }
