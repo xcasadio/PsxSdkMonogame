@@ -101,6 +101,11 @@ public static class LibDs
         new(StringComparer.OrdinalIgnoreCase);
     private static int s_nextBaseLba = 150;
 
+    // JUSTIFICATION: PSX hardware adaptation only — identifies a fresh XA stream versus a seek
+    // within the current file. The CD decoder starts a new file with cleared predictor history,
+    // while a recovery seek in the same stream must preserve continuity.
+    private static FileRegistration s_lastStreamRegistration;
+
     // Max LBA that still fits in BCD MSF (99:59:74 -> ((99*60)+59)*75+74-150 = 449849), per the
     // pinned CdlLOC convention.
     private const int MaxBcdLba = 449849;
@@ -480,8 +485,14 @@ public static class LibDs
         long byteOffset = (long)(lba - reg.BaseLba) * reg.SectorSize;
         stream.Seek(byteOffset, SeekOrigin.Begin);
 
+        if (s_lastStreamRegistration != null && !ReferenceEquals(s_lastStreamRegistration, reg))
+        {
+            XaAudio.Flush();
+        }
+
         CurrentStreamSource?.Dispose();
         CurrentStreamSource = new DsStreamSource(stream, lba, reg.SectorSize);
+        s_lastStreamRegistration = reg;
         return 1;
     }
 
