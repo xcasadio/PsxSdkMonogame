@@ -173,7 +173,33 @@ public static class LibGte
         Array.Copy(s_matrixStackT[s_matrixStackDepth], gteTR, 3);
     }
 
-    public static void ReadRotMatrix(MATRIX m) => Array.Copy(gteR, m.m, 9);
+    // GHIDRA: ReadRotMatrix @ 0x8006D3B4 (TITLE.EXE)
+    // CERTAIN — the whole 72-byte body read from the image with synchronized disassembly. It is TWO
+    // halves, not one. First `gte_stR11R12` / `stR13R21` / `stR22R23` / `stR31R32` / `stR33` into
+    // t0-t4, then five 32-bit `sw` to a0+0x00/+0x04/+0x08/+0x0C/+0x10 — the nine packed rotation
+    // shorts. THEN `gte_stTRX t0` / `gte_stTRY t1` / `gte_stTRZ t2` at 0x8006D3DC-0x8006D3E4 and three
+    // more `sw` to a0+0x14/+0x18/+0x1C at 0x8006D3E8-0x8006D3F0 — which is exactly where MATRIX.t
+    // begins. So ReadRotMatrix writes the TRANSLATION as well, despite its rotation-only name; this
+    // is the same trap ReadTransMatrix's comment below already flags from the other direction.
+    // CORRECTED 2026-08-30: this was `Array.Copy(gteR, m.m, 9)` alone — the 3x3 only — and carried no
+    // GHIDRA line at all. The missing half is load-bearing. FUN_80048f88 @0x80048F88 captures the
+    // live matrix with ReadRotMatrix and later hands it to CompMatrix as m0, and CompMatrix READS
+    // m0.t (`outM.t[i] = StMacN() + m0.t[i]`, see its body at the end of this file). With t left at
+    // zero every sprite the title screen composes is placed against a null translation.
+    // Nothing in the repository called ReadRotMatrix or ReadTransMatrix when this was corrected
+    // (repo-wide grep over *.cs: matches in this file and two prose comments, no call site), so the
+    // change cannot regress an existing caller.
+    // PARTIAL: the fifth rotation store is a full `sw` at m+0x10, so on hardware it also overwrites
+    // the two pad bytes at m+0x12 with the high half of the sign-extended R33 readback. MATRIX here
+    // has no field there — the same representation gap ScaleMatrix, CompMatrix and MulMatrix0 already
+    // document, and no reader of those two bytes is known.
+    public static void ReadRotMatrix(MATRIX m)
+    {
+        Array.Copy(gteR, m.m, 9);
+        m.t[0] = gteTR[0];
+        m.t[1] = gteTR[1];
+        m.t[2] = gteTR[2];
+    }
 
     // GHIDRA: gte_ReadTransMatrix — CERTAIN, closed by raw COP2 decode of the push branch at
     // ProcessAnimationMatrices 0x8003a3ec-0x8003a404: `cfc2 t4,$5` / `cfc2 t5,$6` / `cfc2 t6,$7`
@@ -189,6 +215,12 @@ public static class LibGte
         m.t[1] = gteTR[1];
         m.t[2] = gteTR[2];
     }
+    // PARTIAL, and DELIBERATELY LEFT AS IS: this byte[] overload has the SAME gap the MATRIX overload
+    // above was just corrected for — it writes the nine rotation shorts at +0x00..+0x11 and does not
+    // write the three translation words the real 0x8006D3B4 stores at +0x14/+0x18/+0x1C. It has no
+    // call site anywhere in the repository (repo-wide grep over *.cs), so it is reported rather than
+    // changed; a future caller that binds a MATRIX-shaped byte buffer needs the t[] half added here
+    // first, mirroring the MATRIX overload.
     public static void ReadRotMatrix(byte[] buf, int byteOffset)
     {
         for (int i = 0; i < 9; i++) BitConverter.GetBytes(gteR[i]).CopyTo(buf, byteOffset + i * 2);
@@ -380,6 +412,73 @@ public static class LibGte
         BitConverter.GetBytes(0).CopyTo(pBuf, pOff);
         BitConverter.GetBytes(0).CopyTo(flagBuf, flagOff);
         return sz >> 2;
+    }
+
+    // GHIDRA: RotAverage4 @ 0x8006D5D8 (TITLE.EXE)
+    // CERTAIN — the whole 124-byte body read instruction by instruction from the image, and Ghidra's
+    // synchronized disassembly agrees line for line:
+    //   0x8006D5D8  ldv3 a0,a1,a2                     load V0,V1,V2 from the first three SVECTORs
+    //   0x8006D5F4  RTPT                              project all three in one op
+    //   0x8006D5F8..0x8006D600  lw t0/t1/t2,0x10/0x14/0x18(sp)   the sxy0 / sxy1 / sxy2 pointers
+    //   0x8006D604  stsxy3 t0,t1,t2                   SXY0,SXY1,SXY2 -> the three destinations
+    //   0x8006D610  gte_stFLAG v1                     f0 = FLAG after the RTPT
+    //   0x8006D614  ldv0 a3                           load V0 from the fourth SVECTOR
+    //   0x8006D620  RTPS                              project the fourth
+    //   0x8006D624..0x8006D62C  lw t0/t1/t2,0x1c/0x20/0x24(sp)   the sxy3 / p / flag pointers
+    //   0x8006D630  stsxy t0                          SXY2 -> sxy3
+    //   0x8006D634  gte_stFLAG t0                     f1 = FLAG after the RTPS
+    //   0x8006D638  stdp t1                           IR0 -> *p
+    //   0x8006D63C..0x8006D640  or t0,t0,v1 / sw t0,0x0(t2)      *flag = f1 | f0
+    //   0x8006D644  AVSZ4
+    //   0x8006D648  gte_stOTZ v0                      return OTZ
+    // Ghidra's own prototype is
+    //   long RotAverage4(SVECTOR *v0,*v1,*v2,*v3, long *sxy0,*sxy1,*sxy2,*sxy3, long *p, long *flag)
+    // TWO GTE OPS, NOT FOUR — the same RTPT-then-RTPS structure RotTransPers4 above documents, and the
+    // reason the fourth store reads SXY2 a second time: the XY-FIFO has shifted under it.
+    // JUSTIFICATION: C# language bridge only, for the PARAMETER SHAPE. The four vertices are
+    // scratchpad SVECTOR objects in the caller (FUN_80048f88 @0x80048F88 passes &SVECTOR_1f800020,
+    // 0x28, 0x30, 0x38), while the four sxy destinations are words INSIDE one POLY_FT4 packet that
+    // lives in a byte array (prim+0x08, +0x10, +0x18, +0x20), so those must be a (buffer, offset)
+    // pair. This mirrors the shape RotTransPers4 above already uses, for exactly the same reason.
+    // PARTIAL, inherited from RotTransPers and RotTransPers4 and stated the same way there: this port
+    // models neither IR0 nor the GTE FLAG register, so `stdp` and the `f1 | f0` OR have nothing to
+    // read and pOut[0] / flagOut[0] are written as 0 rather than as the real values. FUN_80048f88's
+    // two destinations are DAT_1f800074 and DAT_1f800078; a cross-reference search over TITLE.EXE
+    // finds no reader of either — they are write-only sinks. Any future caller that does read them
+    // needs those two registers modelled first.
+    public static int RotAverage4(SVECTOR v0, SVECTOR v1, SVECTOR v2, SVECTOR v3,
+        byte[] sxyBuf, int sxy0Off, int sxy1Off, int sxy2Off, int sxy3Off,
+        int[] pOut, int[] flagOut)
+    {
+        LdV3(v0, v1, v2);
+        Rtpt();
+        StSxy3(sxyBuf, sxy0Off, sxy1Off, sxy2Off);
+        // The three Z results the RTPT just produced. Rtpt writes them into FIXED slots (SZ1/SZ2/SZ3)
+        // instead of shifting a 4-deep register — see its own comment — so they have to be taken here,
+        // before the RTPS below overwrites SZ3.
+        ushort z0 = gteSZ[1], z1 = gteSZ[2], z2 = gteSZ[3];
+
+        LdV0(v3);
+        Rtps();
+        StSxy(sxyBuf, sxy3Off);
+        ushort z3 = gteSZ[3];
+
+        pOut[0] = 0;    // stdp @0x8006D638: IR0, not modelled — see the PARTIAL above
+        flagOut[0] = 0; // sw @0x8006D640: f1 | f0, the FLAG register, not modelled
+
+        // JUSTIFICATION: PSX hardware adaptation only
+        // RELATION: puts the Z-FIFO into the state the console holds when the AVSZ4 at 0x8006D644
+        // executes. On hardware every projection PUSHES the FIFO (SZ0<-SZ1<-SZ2<-SZ3<-new), so after
+        // RTPT (three pushes) plus RTPS (one more) the four slots hold the four projected points in
+        // order: SZ0=v0, SZ1=v1, SZ2=v2, SZ3=v3. This port's Rtpt/Rtps deliberately write fixed slots
+        // rather than model the shift register, so composing them leaves SZ0 stale and loses v2's
+        // result under v3's. AVSZ4 is the first operation in this port that reads all four slots, so
+        // the FIFO is reconciled here — locally, at the one call site that needs it — rather than by
+        // changing two shared pseudo-ops that no other code currently calls.
+        gteSZ[0] = z0; gteSZ[1] = z1; gteSZ[2] = z2; gteSZ[3] = z3;
+
+        Avsz4();
+        return StOtz();
     }
 
     // GHIDRA: gte_stlvnl — stores the CURRENT MAC1-3 (UNsaturated 32-bit accumulator, not IR) as 3
@@ -1301,6 +1400,28 @@ public static class LibGte
     public static void Avsz3()
     {
         gteMAC0 = 0x155 * (gteSZ[1] + gteSZ[2] + gteSZ[3]);
+        int otz = gteMAC0 >> 12;
+        gteOTZ = otz > 0xFFFF ? 0xFFFF : otz < 0 ? 0 : otz;
+    }
+
+    // GHIDRA: gte_avsz4 (AVSZ4) — the four-term sibling of gte_avsz3 above:
+    //     MAC0 = ZSF4 * (SZ0 + SZ1 + SZ2 + SZ3),   OTZ = Sat0..FFFF(MAC0 >> 12)
+    // Issued by RotAverage4 @ 0x8006D5D8 at 0x8006D644 (`AVSZ4`), immediately before the
+    // `gte_stOTZ v0` at 0x8006D648 that supplies that routine's return value. Unlike AVSZ3 it reads
+    // ALL FOUR Z-FIFO slots, which is why RotAverage4 reconciles the FIFO before calling it — see the
+    // note there.
+    // ZSF4 = 0x100 is CLOSED, read from the image rather than carried over from the InitGeom comment:
+    // InitGeom @ 0x8006E1F0 issues `gte_ldZSF4(0x100)` at 0x8006E230, in the same seven-register block
+    // that loads ZSF3 = 0x155, H = 1000, DQA, DQB, OFX and OFY. It is loaded once and never reloaded.
+    // 0x100 * 4 / 0x1000 = 0.25 EXACTLY, so AVSZ4 gives the average SZ divided by four — the same
+    // "OTZ as SZ >> 2" convention Avsz3 (0x155 * 3 / 0x1000 = 0.2498) and RotTransPers/StOpz/StSzOtz
+    // already use, so all three agree.
+    // JUSTIFICATION: PSX hardware adaptation only — the ZSF4 control register (COP2 $30) is not a
+    // field of this port for the same reason ZSF3 is not: the game loads it once from InitGeom and
+    // nothing else in TITLE.EXE writes it, so the constant is inlined here exactly as in Avsz3.
+    public static void Avsz4()
+    {
+        gteMAC0 = 0x100 * (gteSZ[0] + gteSZ[1] + gteSZ[2] + gteSZ[3]);
         int otz = gteMAC0 >> 12;
         gteOTZ = otz > 0xFFFF ? 0xFFFF : otz < 0 ? 0 : otz;
     }

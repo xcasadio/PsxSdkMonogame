@@ -1658,11 +1658,29 @@ public static class LibGpu
     }
 
     // JUSTIFICATION: PSX hardware adaptation only — the link field of an ordering-table entry or a
-    // primitive tag holds an address with its top byte dropped; main RAM is mirrored at
-    // 0x80000000, so restoring that byte is the whole of the conversion.
+    // primitive tag holds an address with its top byte dropped. Main RAM answers at both 0x00000000
+    // and 0x80000000: KUSEG and KSEG0 are mirrors of the same physical words, and the GPU's DMA
+    // reads the physical address, so a link is satisfied by whichever mirror a region declared.
+    //
+    // Both have to be tried, because a port declares whatever address the original computed. The
+    // 0x80000000 form covers a global in an overlay's .bss. The bare form covers the heap:
+    // TITLE.EXE arms InitHeap at 0x00010000, which is what the console does too — a break at the
+    // title task's AddPrim read the primitive pointer as 0x00017CB4, with no segment bit.
+    //
+    // Trying only the 0x80000000 mirror silently dropped every primitive that lived on the heap.
+    // For TITLE.EXE that was all of them: the title task keeps its two background bands in its
+    // heap-allocated task context, and FUN_80048f88 @ 0x80048F88 draws its sprites out of a
+    // malloc'd pool. The ordering table linked them correctly and the walk then failed to resolve
+    // a single one, so the screen stayed black with nothing to show for it.
     public static bool RamResolveLink(uint link, out byte[] buffer, out int offset)
     {
-        return RamResolve(unchecked((int)(0x80000000u | (link & 0x00ffffff))), out buffer, out offset);
+        uint low = link & 0x00ffffff;
+        if (RamResolve(unchecked((int)(0x80000000u | low)), out buffer, out offset))
+        {
+            return true;
+        }
+
+        return RamResolve(unchecked((int)low), out buffer, out offset);
     }
 
     // =========================================================================
