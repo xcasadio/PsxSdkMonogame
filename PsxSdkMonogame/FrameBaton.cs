@@ -73,8 +73,35 @@ public static class FrameBaton
     // blank. Throws GameShutdownException if the host requested shutdown while parked, so the game
     // thread unwinds its call stack cleanly (through the translittered runtime's real call frames)
     // instead of being killed mid-instruction.
+    // JUSTIFICATION: backend MonoGame only — lets an offline bench drive runtime code that waits
+    // on the vertical retrace. With no host thread there is nobody to release the baton, so the
+    // first VSync would block for ever and a bench could never reach a frame loop at all.
+    // The budget bounds the run: once that many yields have happened the game thread unwinds
+    // through GameShutdownException, exactly as it does when the window closes.
+    public static bool RunHeadless;
+    public static int HeadlessFrameBudget;
+    private static int s_headlessYields;
+
+    public static void ResetHeadless(int frameBudget)
+    {
+        RunHeadless = true;
+        HeadlessFrameBudget = frameBudget;
+        s_headlessYields = 0;
+    }
+
     public static void YieldToHost()
     {
+        if (RunHeadless)
+        {
+            s_headlessYields++;
+            if (HeadlessFrameBudget > 0 && s_headlessYields >= HeadlessFrameBudget)
+            {
+                throw new GameShutdownException();
+            }
+
+            return;
+        }
+
         FrameReady.Release();
         MayContinue.Wait();
 
