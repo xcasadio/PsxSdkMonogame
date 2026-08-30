@@ -85,6 +85,20 @@ public static class PadInputBackend
     // the low half.
     public static uint PublishedActiveLow => s_published;
 
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: the BIOS pad driver's status byte at buffer offset +0, which the InitPAD path
+    // reads as presence (0 = pad present). LibEtc's PadRead path has no equivalent — its single
+    // 32-bit word carries buttons only — so this is published separately rather than folded into
+    // PublishedActiveLow. Port 1 is always present because the keyboard is its device; port 2 is
+    // present only when a second gamepad really is connected. Consumer: LibApi.WriteBiosPadBuffer,
+    // and through it SELECT.EXE's FUN_800261E4 @ 0x800261E4.
+    private static volatile bool s_port1Connected = true;
+    private static volatile bool s_port2Connected;
+
+    public static bool PublishedPort1Connected => s_port1Connected;
+
+    public static bool PublishedPort2Connected => s_port2Connected;
+
     // JUSTIFICATION: backend MonoGame only
     // RELATION: called once per host frame, from the host thread, to sample keyboard and gamepad.
     public static void Poll()
@@ -93,6 +107,8 @@ public static class PadInputBackend
         ushort port2 = SamplePort(PlayerIndex.Two, keyboardIsPort1: false);
         uint sampled = (uint)(port2 << 16) | port1;
         s_published = sampled;
+        s_port1Connected = true;
+        s_port2Connected = GamePad.GetState(PlayerIndex.Two).IsConnected;
 
         if (s_diag && sampled != s_lastTraced)
         {

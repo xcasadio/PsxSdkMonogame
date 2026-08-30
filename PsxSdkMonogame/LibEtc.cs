@@ -82,6 +82,15 @@ public static class LibEtc
     private static void WaitVBlankInterrupt()
     {
         FrameBaton.YieldToHost();
+
+        // The BIOS pad driver (LibApi InitPAD/StartPAD — SELECT.EXE's input path, see the block
+        // comment there) samples the controllers off this same interrupt and refreshes the status
+        // buffers it was handed. Placed immediately after the yield so the buffers hold the
+        // sample the host just took, and before the V-BLANK callback, which on console also runs
+        // after the driver's own handler. It is a no-op until StartPAD has been called, so
+        // TITLE.EXE's libetc PadRead path below is untouched.
+        LibApi.RefreshBiosPadBuffers();
+
         g_vblankCounter++;
         g_vsyncCallback?.Invoke();
     }

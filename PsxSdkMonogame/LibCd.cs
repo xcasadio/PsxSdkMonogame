@@ -164,12 +164,152 @@ public static class LibCd
         return default;
     }
 
-    public static int CdControl(byte com, byte[] param, byte[] result)
+    // =======================================================================================
+    // CdControl / CdControlB / CdControlF — the libcd command layer
+    // =======================================================================================
+    //
+    // CLOSED 2026-08-30 from /SELECT.EXE, which links the real Sony libcd. Before this tranche
+    // the three routines were command-by-command guesses: CdControl answered only 0x02/0x15,
+    // CdControlB answered only 0x09, CdControlF answered nothing, and every other command
+    // returned 0. SELECT.EXE retries commands in `do { r = ...; } while (r == 0);` loops on
+    // main's first-frame path, so "return 0" was an infinite loop:
+    //     FUN_80030908 @ 0x80030908 line 21   do { CdControlB(0x0E, {0x80}, 0); } while (r == 0)
+    //     FUN_800258F0 @ 0x800258F0 line 19   do { CdControlB(0x0A, 0, result); } while (r == 0)
+    //     FUN_800258F0 @ 0x800258F0 line 22   do { CdControlB(0x0E, mode, result); } while (r == 0)
+    //     FUN_80025894 @ 0x80025894 lines 8/11 the same two loops for 0x0A and 0x08
+    //     FUN_80025788 @ 0x80025788 line 21   do { CdControl(0x03, &toc[n], r); } while (r == 0)
+    // The bodies below are transliterated instead, so the loops terminate because the routine
+    // says so — not because a command was special-cased.
+    //
+    // The three share one shape: up to four attempts, an auto-Setloc for the commands that carry
+    // a disc position, and a disc-lid recovery branch for command 0x10.
+
+    // GHIDRA: DAT_80050384 @ 0x80050384 (SELECT.EXE)
+    // One int per command index: non-zero means "this command carries a disc position, and the
+    // wrapper must issue CdlSetloc (command 2) with it before issuing the command itself".
+    // Read out of the image with read-memory (128 bytes at 0x80050384). The only non-zero
+    // entries are 0x03, 0x06, 0x15, 0x16 and 0x1B. This is what makes FUN_80025788's
+    // CdControl(0x03, &TOC[track], ...) actually seek: the position reaches the drive through
+    // the implied Setloc, not through the Play command.
+    private static readonly int[] DAT_80050384 =
     {
-        // 0x02 is CdlSetloc and 0x15 is CdlSeekL. Both leave the drive pointing at the same place,
-        // which is all this port models. ReadCDData @ 0x80057E40 uses Setloc, the FMV players use
-        // SeekL, and both then read from the position recorded here.
-        if ((com == 0x02 || com == 0x15) && param != null && param.Length >= 3)
+        0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+    };
+
+    // GHIDRA: DAT_80050648 @ 0x80050648 (SELECT.EXE)
+    // One int per command index: how many parameter bytes the command takes. Read out of the
+    // image the same way. Non-zero entries: 0x02 -> 3, 0x0D -> 2, 0x0E -> 1, 0x12 -> 1,
+    // 0x14 -> 1. CD_cw rejects a command with a non-zero count and a NULL param.
+    private static readonly int[] DAT_80050648 =
+    {
+        0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0,
+        0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    };
+
+    // JUSTIFICATION: C# language bridge only
+    // RELATION: the original indexes both tables with the raw command byte and would read past
+    // them for a command above 0x1F. No caller issues one; this bounds the read instead of
+    // reproducing an out-of-bounds access that C# cannot express.
+    private static int CommandTableEntry(int[] table, uint com) => com < table.Length ? table[com] : 0;
+
+    // GHIDRA: DAT_80050404 @ 0x80050404 (SELECT.EXE)
+    // The CdSyncCallback hook. All three wrappers save it, clear it while a non-Nop command is
+    // in flight and restore it afterwards; the assignments are reproduced literally below.
+    // PARTIAL: nothing consumes it in this port — the desktop CD_cw has no interrupt path, and
+    // CdSyncCallback above is still a stub — so it is written and never read.
+    private static CdlCB DAT_80050404;
+
+    // GHIDRA: DAT_80050414 @ 0x80050414 (SELECT.EXE)
+    // The drive status byte the libcd interrupt path maintains. Link-time .data value, read with
+    // read-memory: 0. It has no desktop source and stays 0, which makes the command-0x10 branch
+    // below reachable in principle; no call site in SELECT.EXE or in this port issues command
+    // 0x10, so it never runs.
+    private static byte DAT_80050414 = 0;
+
+    // GHIDRA: DAT_80050424 @ 0x80050424 (SELECT.EXE)
+    // The mode byte cached by CD_cw after a completed Setmode (CD_cw line 79-81).
+    private static byte DAT_80050424;
+
+    // GHIDRA: DAT_8005041C @ 0x8005041C (SELECT.EXE)
+    // Media-change generation counter, maintained by the libcd interrupt path. Link-time .data
+    // value, read with read-memory: 0.
+    private static int DAT_8005041c = 0;
+
+    // GHIDRA: DAT_8005070C @ 0x8005070C (SELECT.EXE)
+    // The generation CD_shell last handled. Link-time .data value: 1.
+    private static int DAT_8005070c = 1;
+
+    // GHIDRA: DAT_80050710 @ 0x80050710 (SELECT.EXE)
+    // The parameter block CD_shell hands to its CD_cw(0x16, ...) retry. Link-time .data bytes,
+    // read with read-memory: 02 00 00 00.
+    private static readonly byte[] DAT_80050710 = { 0x02, 0x00, 0x00, 0x00 };
+
+    // GHIDRA: CD_shell @ 0x80045AB8 (SELECT.EXE)
+    // The disc-lid open/close recovery every non-Nop command runs first. Transliterated whole,
+    // because it costs nothing and it is the guard — not this port — that decides the body never
+    // runs: `DAT_8005070C < DAT_8005041C` is 1 < 0 with the link-time values above, and neither
+    // counter has a desktop source to change it. Even if the guard did open, both loops exit on
+    // the first test here: the lid bit of DAT_80050414 is clear, and the desktop CD_cw returns 0.
+    private static void CD_shell()
+    {
+        bool bVar1;
+        CdlCB uVar2;
+        int iVar3;
+        sbyte cVar4;
+
+        uVar2 = DAT_80050404;
+        cVar4 = 0;
+        if (DAT_8005070c < DAT_8005041c)
+        {
+            DAT_80050404 = null;
+            while ((DAT_80050414 & 0x10) != 0)
+            {
+                bVar1 = cVar4 == 0;
+                cVar4 = (sbyte)(cVar4 + 1);
+                if (bVar1)
+                {
+                    Console.WriteLine("CD opening...");
+                }
+
+                CD_cw(1, null, null, 0);
+            }
+
+            while ((iVar3 = CD_cw(0x16, DAT_80050710, null, 0)) != 0)
+            {
+                CD_cw(1, null, null, 0);
+                Console.WriteLine("CD closing...");
+            }
+
+            DAT_8005070c = DAT_8005041c;
+        }
+
+        DAT_80050404 = uVar2;
+    }
+
+    // GHIDRA: CD_cw @ 0x800455C8 (SELECT.EXE)
+    // PARTIAL: control flow and return contract closed; the hardware half adapted.
+    //
+    // What the original does, line by line, and what survives here:
+    //   line 15  if (DAT_80050648[com] != 0 && param == NULL) -> -2, the "no param" rejection
+    //   line 19  if (com == 2) copy 4 bytes of param into DAT_80050420      -> the seek latch
+    //   line 30+ write CDROM_REG0/REG1/REG2 and, when param_4 == 0, spin on the drive interrupt
+    //   line 79  if (status == 2 && com == 0x0E) DAT_80050424 = param[0]    -> the mode cache
+    //   line 83  if (result != NULL) copy 8 result bytes out of DAT_8005686C
+    //   line 93  return -(DAT_800506E0 == 5), i.e. 0 unless the drive reported CdlDiskError
+    //   line 43  when param_4 != 0 (the CdControlF path) it never waits and returns 0
+    // There is no drive to report CdlDiskError on desktop and no interrupt to wait for, so this
+    // returns 0 (accepted) for every command it does not reject on the parameter gate. The
+    // result buffer is left alone: the eight bytes it would copy come from the drive's own
+    // response FIFO, which this port does not model.
+    private static int CD_cw(byte com, byte[] param, byte[] result, int param_4)
+    {
+        if (CommandTableEntry(DAT_80050648, com) != 0 && param == null)
+        {
+            return -2;
+        }
+
+        if (com == 2 && param.Length >= 3)
         {
             s_lastSeekTarget = new CdlLOC
             {
@@ -178,47 +318,260 @@ public static class LibCd
                 sector = param[2],
                 track = param.Length > 3 ? param[3] : (byte)0,
             };
-            return 1;
+        }
+
+        if (com == 0x0E && param.Length >= 1)
+        {
+            DAT_80050424 = param[0];
+        }
+
+        if (com == 9)
+        {
+            // JUSTIFICATION: PSX hardware adaptation only — desktop effect of command 0x09.
+            // Previously the whole of CdControlB; kept here because the command means the same
+            // thing whichever wrapper issues it. Call sites: MOVIE_EXE/SLPS_003_55 FMV teardown.
+            LibDs.CurrentStreamSource?.Dispose();
+            LibDs.CurrentStreamSource = null;
         }
 
         return 0;
     }
 
+    // GHIDRA: CdControl @ 0x800444A8 (SELECT.EXE)
+    // Returns 1 as soon as CD_cw accepts the command, 0 after four failed attempts.
+    // The command-0x10 branch is transliterated from the bytes rather than from the decompiler:
+    // Ghidra renders it as `CD_shell(); return SYS_OBJ_2BC();`, but 0x80044524-0x80044530 read
+    //     0C 01 16 AE   jal 0x80045AB8      (CD_shell)
+    //     26 10 FF FF   addiu s0, s0, -1    (delay slot: the retry counter)
+    //     08 01 11 6A   j 0x800445A8        (the loop test `bne s0, v0`)
+    //     24 02 FF FF   addiu v0, zero, -1  (delay slot: the loop-test constant)
+    // so it consumes one attempt and goes round again. CdControlB has the identical bytes at
+    // 0x800447A0-0x800447AC.
+    public static int CdControl(byte com, byte[] param, byte[] result)
+    {
+        uint uVar1;
+        CdlCB uVar2;
+        CdlCB uVar3;
+        int iVar4;
+        int iVar5;
+
+        uVar2 = DAT_80050404;
+        iVar5 = 3;
+        uVar1 = com;
+        do
+        {
+            if ((uVar1 == 0x10) && ((DAT_80050414 & 0x20) == 0))
+            {
+                CD_shell();
+            }
+            else
+            {
+                uVar3 = DAT_80050404;
+                bool issue = uVar1 == 1;
+                if (!issue)
+                {
+                    DAT_80050404 = null;
+                    CD_shell();
+                    uVar3 = uVar2;
+                    issue = (param == null) || (CommandTableEntry(DAT_80050384, uVar1) == 0);
+                    if (!issue)
+                    {
+                        iVar4 = CD_cw(2, param, result, 0);
+                        issue = iVar4 == 0;
+                    }
+                }
+
+                if (issue)
+                {
+                    DAT_80050404 = uVar3;
+                    iVar4 = CD_cw(com, param, result, 0);
+                    if (iVar4 == 0)
+                    {
+                        return 1;
+                    }
+                }
+            }
+
+            iVar5 = iVar5 + -1;
+            if (iVar5 == -1)
+            {
+                DAT_80050404 = uVar2;
+                return 0;
+            }
+        } while (true);
+    }
+
     // JUSTIFICATION: C# language bridge only
-    // RELATION: typed form of CdControl(CdlSeekL, CdlLOC*, result).
+    // RELATION: typed form of CdControl(com, CdlLOC*, result) — the original takes a u_char*
+    // that the caller happens to point at a CdlLOC.
     public static int CdControl(byte com, CdlLOC param, byte[] result)
     {
-        if ((com != 0x02 && com != 0x15) || param == null)
+        return CdControl(com, CdlLocToBytes(param), result);
+    }
+
+    // JUSTIFICATION: C# language bridge only
+    // RELATION: the original passes the CdlLOC's four bytes straight through as the command's
+    // parameter block; C# needs the conversion spelled out.
+    private static byte[] CdlLocToBytes(CdlLOC loc)
+    {
+        return loc == null
+            ? null
+            : new[] { loc.minute, loc.second, loc.sector, loc.track };
+    }
+
+    // GHIDRA: CdControlB @ 0x8004472C (SELECT.EXE)
+    // Same body as CdControl up to the exit, then the blocking tail. The tail is decoded from
+    // 0x80044834-0x80044850, which the decompiler renders as `CD_sync(0, result); return
+    // SYS_OBJ_568();` — SYS_OBJ_568 @ 0x80044854 is only the register-restore epilogue, so the
+    // return value is whatever v0 holds at the jump into it, and the four instructions that set
+    // it are:
+    //     14 40 00 06   bne v0, zero, 0x80044850   (v0 = the accepted/failed flag)
+    //     00 00 20 21   addu a0, zero, zero        (delay slot: CD_sync's mode = 0)
+    //     0C 01 14 1D   jal 0x80045074             (CD_sync)
+    //     02 60 28 21   addu a1, s3, zero          (delay slot: result)
+    //     38 42 00 02   xori v0, v0, 0x2
+    //     08 01 12 15   j 0x80044854
+    //     2C 42 00 01   sltiu v0, v0, 1            (delay slot)
+    //     00 00 10 21   addu v0, zero, zero        (0x80044850: the failure path returns 0)
+    // i.e. `return CD_sync(0, result) == 2 ? 1 : 0;` — 2 being CdlComplete. THAT is the whole
+    // reason the retry loops terminate; nothing here is keyed to a command number.
+    // PARTIAL: the original calls the library-internal CD_sync @ 0x80045074; this port has only
+    // the public CdSync, whose desktop body gives the same answer for the same reason (the
+    // command has already completed by the time it is asked — see CdlComplete above).
+    public static int CdControlB(byte com, byte[] param, byte[] result)
+    {
+        uint uVar1;
+        CdlCB uVar2;
+        CdlCB uVar3;
+        int iVar4;
+        int iVar5;
+        int iVar6;
+
+        uVar2 = DAT_80050404;
+        iVar6 = 3;
+        uVar1 = com;
+
+        // PARTIAL: uVar3 and iVar5 are live registers on entry to the loop's exit path when the
+        // very first iteration takes the command-0x10 branch and the retry counter runs out.
+        // The original reads whatever those registers happened to hold; C# requires them to be
+        // assigned, so they start at the saved callback and at the "not accepted" flag, which is
+        // what every other path through the loop leaves behind.
+        uVar3 = uVar2;
+        iVar5 = -1;
+        do
+        {
+            if ((uVar1 == 0x10) && ((DAT_80050414 & 0x20) == 0))
+            {
+                CD_shell();
+            }
+            else
+            {
+                uVar3 = DAT_80050404;
+                bool issue = uVar1 == 1;
+                if (!issue)
+                {
+                    DAT_80050404 = null;
+                    CD_shell();
+                    uVar3 = uVar2;
+                    issue = (param == null) || (CommandTableEntry(DAT_80050384, uVar1) == 0);
+                    if (!issue)
+                    {
+                        iVar4 = CD_cw(2, param, result, 0);
+                        issue = iVar4 == 0;
+                    }
+                }
+
+                if (issue)
+                {
+                    DAT_80050404 = uVar3;
+                    iVar4 = CD_cw(com, param, result, 0);
+                    iVar5 = 0;
+                    uVar3 = DAT_80050404;
+                    if (iVar4 == 0)
+                    {
+                        break;
+                    }
+                }
+            }
+
+            iVar6 = iVar6 + -1;
+            iVar5 = -1;
+            uVar3 = uVar2;
+        } while (iVar6 != -1);
+
+        DAT_80050404 = uVar3;
+        if (iVar5 != 0)
         {
             return 0;
         }
 
-        s_lastSeekTarget = new CdlLOC
-        {
-            minute = param.minute,
-            second = param.second,
-            sector = param.sector,
-            track = param.track,
-        };
-        return 1;
+        return CdSync(0, result) == CdlComplete ? 1 : 0;
     }
 
-    public static int CdControlB(byte com, byte[] param, byte[] result)
-    {
-        if (com == 9)
-        {
-            LibDs.CurrentStreamSource?.Dispose();
-            LibDs.CurrentStreamSource = null;
-            return 1;
-        }
+    // NOTE: there is deliberately no CdControlB(byte, CdlLOC, byte[]) overload to match
+    // CdControl's. FUN_800258F0 @ 0x800258F0 passes &DAT_80055CEC + track * 4 — a u_char* into
+    // the TOC table CdGetToc filled — and a port renders that as a byte[] slice, not as a CdlLOC
+    // object. Adding the typed overload also made every existing `CdControlB(9, null, null)`
+    // call site ambiguous; CdlLocToBytes above is the conversion when one is needed.
 
-        return 0;
-    }
-
+    // GHIDRA: CdControlF @ 0x800445F0 (SELECT.EXE)
+    // The fire-and-forget form: identical to CdControl except that it passes result = NULL and
+    // param_4 = 1 to CD_cw for the command itself (line 24, `CD_cw(com, param, 0, 1)`) while the
+    // implied Setloc still goes through with param_4 = 0 (line 34, `CD_cw(2, param, 0, 0)`).
+    // callerCount is 0 in SELECT.EXE, so nothing here exercises it; it is transliterated because
+    // it had the same "return 0 for everything" gap as its two siblings.
     public static int CdControlF(byte com, byte[] param)
     {
-        /* Do nothing */
-        return default;
+        uint uVar1;
+        CdlCB uVar2;
+        CdlCB uVar3;
+        int iVar4;
+        int iVar5;
+
+        uVar2 = DAT_80050404;
+        iVar5 = 3;
+        uVar1 = com;
+        do
+        {
+            if ((uVar1 == 0x10) && ((DAT_80050414 & 0x20) == 0))
+            {
+                CD_shell();
+            }
+            else
+            {
+                uVar3 = DAT_80050404;
+                bool issue = uVar1 == 1;
+                if (!issue)
+                {
+                    DAT_80050404 = null;
+                    CD_shell();
+                    uVar3 = uVar2;
+                    issue = (param == null) || (CommandTableEntry(DAT_80050384, uVar1) == 0);
+                    if (!issue)
+                    {
+                        iVar4 = CD_cw(2, param, null, 0);
+                        issue = iVar4 == 0;
+                    }
+                }
+
+                if (issue)
+                {
+                    DAT_80050404 = uVar3;
+                    iVar4 = CD_cw(com, param, null, 1);
+                    if (iVar4 == 0)
+                    {
+                        return 1;
+                    }
+                }
+            }
+
+            iVar5 = iVar5 + -1;
+            if (iVar5 == -1)
+            {
+                DAT_80050404 = uVar2;
+                return 0;
+            }
+        } while (true);
     }
 
     // JUSTIFICATION: PSX hardware adaptation only (slice S4, XA movie audio)
