@@ -140,6 +140,39 @@ public static class LibGte
 
     // GHIDRA: gte_ReadRotMatrix — inverse of SetRotMatrix: stores the CURRENT RT register set back
     // to memory as 9 shorts (CERTAIN, same evidence as SetRotMatrix).
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: PushMatrix @ 0x8006D274 and PopMatrix @ 0x8006D314 save and restore the current
+    // rotation and translation registers. libgte keeps a small fixed stack for this; the depth
+    // below is generous next to the single nesting level FUN_80037388 @ 0x80037388 uses, and an
+    // overflow throws rather than silently corrupting the matrix like the console would.
+    private static readonly short[][] s_matrixStackR = new short[20][];
+    private static readonly int[][] s_matrixStackT = new int[20][];
+    private static int s_matrixStackDepth;
+
+    public static void PushMatrix()
+    {
+        if (s_matrixStackDepth >= s_matrixStackR.Length)
+        {
+            throw new InvalidOperationException("PushMatrix: GTE matrix stack overflow");
+        }
+
+        s_matrixStackR[s_matrixStackDepth] = (short[])gteR.Clone();
+        s_matrixStackT[s_matrixStackDepth] = (int[])gteTR.Clone();
+        s_matrixStackDepth++;
+    }
+
+    public static void PopMatrix()
+    {
+        if (s_matrixStackDepth == 0)
+        {
+            throw new InvalidOperationException("PopMatrix: GTE matrix stack underflow");
+        }
+
+        s_matrixStackDepth--;
+        Array.Copy(s_matrixStackR[s_matrixStackDepth], gteR, 9);
+        Array.Copy(s_matrixStackT[s_matrixStackDepth], gteTR, 3);
+    }
+
     public static void ReadRotMatrix(MATRIX m) => Array.Copy(gteR, m.m, 9);
 
     // GHIDRA: gte_ReadTransMatrix — CERTAIN, closed by raw COP2 decode of the push branch at
