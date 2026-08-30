@@ -468,10 +468,41 @@ public static class LibGpu
      * @param y Vertical frame buffer address
      * @return CLUT ID
      */
+    // GHIDRA: LoadClut @ 0x80074E50 (TITLE.EXE)
+    // CLOSED 2026-08-30: decoded from the 26 instructions at 0x80074E50..0x80074EB7, read out of
+    // the image with read-memory. This supersedes an earlier reading that was recorded as an
+    // unverified guess; the body below is what the bytes actually do.
+    //
+    //   addiu sp,sp,-0x28 ... addiu a0,sp,0x10      one RECT on the stack at sp+0x10
+    //   ori v0,zero,0x100 / sh v0,0x14(sp)          rect.w = 0x100   (RECT +4)
+    //   sh s0,0x10(sp)    / sh s1,0x12(sp)          rect.x = x, rect.y = y   (RECT +0, +2)
+    //   ori v0,zero,1     / sh v0,0x16(sp)          rect.h = 1       (RECT +6), in the delay slot
+    //   jal 0x80071D10 (LoadImage)  a0 = &rect, a1 = clut
+    //   jal 0x80070F7C (GetClut)    a0 = x,     a1 = y
+    //   andi v0,v0,0xFFFF                           the result narrowed to 16 bits
+    //
+    // So the transfer is a LoadImage of a 0x100 x 1 rectangle — 256 VRAM halfwords, one CLUT row —
+    // and the returned id is exactly GetClut(x, y). The `andi` is implicit in C# because GetClut
+    // already returns ushort. There is nothing else in the routine: no DrawSync, no read-back, no
+    // state kept, and x/y are passed to GetClut unmodified (GetClut does its own >> 4 and masking).
+    //
+    // WHY THE STUB WAS NOT HARMLESS: FUN_80058a9c @ 0x80058A9C builds a 256-entry CLUT on its stack
+    // (entry 0 = 0x0000, entries 1..255 = 0x8000) and stores the result with `sh` into
+    // DAT_800833f0 @ 0x800833F0 — `DAT_800833f0 = LoadClut((u_long *)&local_210, 0, 500)`. With the
+    // stub that global received 0 instead of GetClut(0, 500) = 0x7D00, and the CLUT row never
+    // reached VRAM at y = 500 at all.
     public static ushort LoadClut(ulong[] clut, int x, int y)
     {
-        // Do nothing PSX SDK
-        return 0;
+        ushort uVar1;
+        RECT local_18 = new RECT();
+
+        local_18.w = 0x100;
+        local_18.x = (short)x;
+        local_18.y = (short)y;
+        local_18.h = 1;
+        LoadImage(local_18, clut);
+        uVar1 = GetClut(x, y);
+        return uVar1;
     }
 
     /**
@@ -484,7 +515,12 @@ public static class LibGpu
      */
     public static ushort LoadClut2(ulong[] clut, int x, int y)
     {
-        // Do nothing PSX SDK
+        // BLOCKED: there are no bytes to transliterate. LoadClut2 is not linked into TITLE.EXE —
+        // get-decompilation finds no such symbol there, nor in SLPS_003.55 or GAME.EXE — so the
+        // routine has no counterpart in this game's images to read. Nothing in the port calls it.
+        // Left as it stands rather than assumed to be a copy of LoadClut @ 0x80074E50 above. The
+        // two names exist separately in the SDK, so they are not known to be the same routine, and
+        // nothing available here can decide what this one does.
         return 0;
     }
 

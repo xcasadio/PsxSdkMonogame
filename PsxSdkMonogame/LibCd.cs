@@ -256,16 +256,81 @@ public static class LibCd
         return default;
     }
 
+    // GHIDRA: CdIntToPos @ 0x80069834 (TITLE.EXE)
+    // CLOSED 2026-08-30: decoded from the 65 instructions at 0x80069834..0x80069937, read out of
+    // the image with read-memory. Not written from general PSX knowledge — every constant below is
+    // one that is actually in those bytes.
+    //
+    // The register form, in order:
+    //   addiu a0,a0,0x96                              i + 150
+    //   lui/ori 0x1B4E81B5, mult, mfhi, sra 3, subu   a2 = (i + 150) / 0x4b   (magic-number divide)
+    //   sll 2 / addu / sll 4 / subu / subu a0         a0 = (i + 150) % 0x4b
+    //   lui/ori 0x88888889, mult, mfhi, addu, sra 5, subu
+    //                                                 t1 = a2 / 0x3c
+    //   sll 4 / subu / sll 2 / subu a2                a2 = a2 % 0x3c
+    //   three times: lui/ori 0x66666667, mult, mfhi, sra 2, subu -> v / 10,
+    //                then sll 4 on the quotient and add (v - (v / 10) * 10)
+    //   sb a0,0x1(v0)   sb a3,0x2(v0)   sb a1,0x0(v0)
+    //   jr ra           with v0 = a1 (the incoming p)
+    //
+    // Four things the bytes decide that lore would only have guessed at:
+    //   * the two-second lead-in IS present, it IS 0x96 = 150 sectors (75 sectors per second), and
+    //     it is added BEFORE any division, so it carries into the minute as well as the frame;
+    //   * the divisors really are 0x4b (75 sectors per second) and 0x3c (60 seconds per minute);
+    //   * the packing is BCD — each field is stored as (v / 10) * 16 + (v % 10). The decompiler
+    //     spells that identity as `v + (v / 10) * 6`, which is the form written below;
+    //   * p->track at +3 is NEVER written. This routine leaves whatever was already there, and so
+    //     does the port. The store order is second (+1), sector (+2), minute (+0).
+    //
+    // All three divisions are SIGNED: the sequences carry the `sra 31` / `subu` sign correction and
+    // use `mult`, not `multu`. C#'s truncating `/` and `%` are therefore the exact match, and the
+    // arithmetic stays in 32 bits — the `sb` is the only truncation, reproduced by the byte casts.
+    //
+    // WHY THE STUB WAS NOT HARMLESS: returning `default` and writing nothing left every CdlLOC at
+    // whatever it already held, so every seek computed through this routine collapsed onto one
+    // sector. LoadFACE_B @ 0x80052D68 walks a twelve-entry table and calls
+    // `CdIntToPos(base + (n - 1) * 2, &cdlFile2.pos)` once per portrait; all twelve reads landed on
+    // the same sector, so the portraits would have been WRONG rather than missing. FUN_800583fc
+    // @ 0x800583FC (ported in TITLE_EXE/LoadingScreen.cs) does
+    // `CdIntToPos(base + DAT_1f80012c * 10, ...)` to pick one of three loading pictures, and its
+    // PARTIAL note records that same lost seek.
     public static CdlLOC CdIntToPos(int i, CdlLOC p)
     {
-        /* Do nothing */
-        return default;
+        int iVar1;
+        int iVar2;
+        int iVar3;
+
+        iVar3 = (i + 0x96) / 0x4b;
+        iVar2 = (i + 0x96) % 0x4b;
+        iVar1 = iVar3 / 0x3c;
+        iVar3 = iVar3 % 0x3c;
+        p.second = (byte)(iVar3 + (iVar3 / 10) * 6);
+        p.sector = (byte)(iVar2 + (iVar2 / 10) * 6);
+        p.minute = (byte)(iVar1 + (iVar1 / 10) * 6);
+        return p;
     }
 
+    // GHIDRA: CdPosToInt @ 0x80069938 (TITLE.EXE)
+    // CLOSED 2026-08-30: decoded from the 32 instructions at 0x80069938..0x800699B7.
+    //   lbu v1,0x0(a0)  lbu a2,0x1(a0)  lbu a1,0x2(a0)   minute, second, sector. track is NOT read.
+    //   srl 4 / sll 2 / addu / sll 1 / andi 0xF / addu   BCD -> binary, once per byte
+    //   sll 4 / subu / sll 2                             * 0x3c
+    //   sll 2 / addu / sll 4 / subu                      * 0x4b
+    //   addiu v0,v0,-0x96                                the same 150-sector lead-in, in the delay
+    //                                                    slot of the `jr ra`
+    // The loads are lbu, so the fields are unsigned; the decompiler's `(uint)` casts say the same,
+    // and C#'s `byte` reproduces it directly. Exact inverse of CdIntToPos above; every call site
+    // uses the two as a pair.
+    //
+    // EQUIVALENCE: LibDs.LbaFromPosition (LibDs.cs:283) computes this same value for the desktop
+    // read path. It is deliberately NOT called from here — rule 3 forbids folding an original
+    // routine into a neighbouring API, and this one has to exist under its own name because the
+    // game calls it directly (LoadFACE_B @ 0x80052D68, FUN_800583fc @ 0x800583FC and six others).
     public static int CdPosToInt(CdlLOC p)
     {
-        /* Do nothing */
-        return default;
+        return ((((p.minute >> 4) * 10 + (p.minute & 0xf)) * 0x3c +
+                 (p.second >> 4) * 10 + (p.second & 0xf)) * 0x4b +
+                (p.sector >> 4) * 10 + (p.sector & 0xf)) + -0x96;
     }
 
     public static CdlFILE CdSearchFile(CdlFILE fp, char name)
