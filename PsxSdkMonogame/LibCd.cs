@@ -130,10 +130,20 @@ public static class LibCd
         return default;
     }
 
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: reports the state of the last command. On console a command completes
+    // asynchronously, so callers spin on this until it stops returning CdlNoIntr; here every
+    // command has already finished by the time it returns, so the honest answer is CdlComplete.
+    //
+    // Returning 0 was NOT neutral: ReadCDData @ 0x80057E40 spins on
+    // `do { status = CdSync(0, result); } while (status == 0);` and hung forever on the stub.
+    // 5 would be the worst answer — that is CdlDiskError, and the enclosing
+    // `while (status == 5)` would retry the read for ever.
+    private const int CdlComplete = 2;
+
     public static int CdSync(int mode, byte[] result)
     {
-        /* Do nothing */
-        return default;
+        return CdlComplete;
     }
 
     public static int CdReady(int mode, byte[] result)
@@ -156,7 +166,10 @@ public static class LibCd
 
     public static int CdControl(byte com, byte[] param, byte[] result)
     {
-        if (com == 0x15 && param != null && param.Length >= 3)
+        // 0x02 is CdlSetloc and 0x15 is CdlSeekL. Both leave the drive pointing at the same place,
+        // which is all this port models. ReadCDData @ 0x80057E40 uses Setloc, the FMV players use
+        // SeekL, and both then read from the position recorded here.
+        if ((com == 0x02 || com == 0x15) && param != null && param.Length >= 3)
         {
             s_lastSeekTarget = new CdlLOC
             {
@@ -175,7 +188,7 @@ public static class LibCd
     // RELATION: typed form of CdControl(CdlSeekL, CdlLOC*, result).
     public static int CdControl(byte com, CdlLOC param, byte[] result)
     {
-        if (com != 0x15 || param == null)
+        if ((com != 0x02 && com != 0x15) || param == null)
         {
             return 0;
         }
@@ -296,6 +309,31 @@ public static class LibCd
     {
         /* Do nothing */
         return default;
+    }
+
+    // GHIDRA: CdRead @ 0x800697B4 (TITLE.EXE)
+    // JUSTIFICATION: C# language bridge only
+    // RELATION: the original takes a u_long* into PSX RAM; ReadCDData @ 0x80057E40 hands it a raw
+    // address, so this overload takes the address and writes through PsxRam. Reads from the
+    // position the last CdlSetloc/CdlSeekL recorded.
+    //
+    // The desktop read is synchronous: by the time this returns, the sectors are already in memory
+    // and CdReadSync has nothing left to wait for, which is why it reports completion immediately.
+    // Returns 1 on success, matching the `while (CdRead(...) != 1)` retry every call site uses.
+    public static int CdRead(int sectors, int psxAddress, int mode)
+    {
+        if (s_lastSeekTarget == null || sectors <= 0)
+        {
+            return 0;
+        }
+
+        int lba = LibDs.LbaFromPosition(
+            s_lastSeekTarget.minute,
+            s_lastSeekTarget.second,
+            s_lastSeekTarget.sector);
+
+        int delivered = LibDs.ReadDataSectors(lba, sectors, psxAddress);
+        return delivered == sectors ? 1 : 0;
     }
 
     public static int CdReadSync(int mode, byte[] result)

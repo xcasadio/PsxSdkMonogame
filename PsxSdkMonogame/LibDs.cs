@@ -138,7 +138,10 @@ public static class LibDs
 
         long lengthBytes = new FileInfo(hostPath).Length;
         int sectorSize = DetectRawSectorSize(hostPath, lengthBytes);
-        int sectorCount = checked((int)(lengthBytes / sectorSize));
+
+        // Raw dumps divide exactly, so this rounding only affects plain data files, whose last
+        // sector is partial on the disc exactly as it is here.
+        int sectorCount = checked((int)((lengthBytes + sectorSize - 1) / sectorSize));
 
         int baseLba = s_nextBaseLba;
         int endLba = baseLba + sectorCount - 1;
@@ -197,9 +200,74 @@ public static class LibDs
             return 2336;
         }
 
-        throw new InvalidDataException(
-            $"LibDs: '{hostPath}' is neither a complete 2352-byte-sector dump nor a 2336-byte-sector stream.");
+        // Anything else is a plain extracted data file: 2048-byte user data with no raw sector
+        // framing. That is what every non-.STR file of this game is — TITLE.B, the CHR_DATA
+        // archives, the overlays — and what ReadFile @ 0x80057DF4 reads through CdRead.
+        // The two raw layouts above are still preferred, so no .STR changes behaviour.
+        return 2048;
     }
+
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: desktop stand-in for the CD drive's data read. Resolves the LBA to the registered
+    // host file, extracts the 2048 bytes of user data from each sector — whatever raw framing that
+    // file uses — and writes them into modelled PSX RAM. This is what CdRead ultimately performs
+    // for ReadCDData @ 0x80057E40.
+    // Returns the number of sectors actually delivered, or -1 when the LBA resolves to no file.
+    public static int ReadDataSectors(int lba, int sectorCount, int psxAddress)
+    {
+        FileRegistration reg = FindRegistrationContaining(lba);
+        if (reg == null)
+        {
+            return -1;
+        }
+
+        int payloadOffset = reg.SectorSize switch
+        {
+            2352 => 24,  // 12 sync + 4 header + 8 subheader
+            2336 => 8,   // 8 subheader
+            _ => 0,      // plain data file
+        };
+
+        byte[] sector = new byte[reg.SectorSize];
+        byte[] payload = new byte[2048];
+        int delivered = 0;
+
+        using var stream = new FileStream(reg.HostPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        for (int i = 0; i < sectorCount; i++)
+        {
+            int index = lba - reg.BaseLba + i;
+            if (index < 0 || index >= reg.SectorCount)
+            {
+                break;
+            }
+
+            stream.Seek((long)index * reg.SectorSize, SeekOrigin.Begin);
+            int read = stream.Read(sector, 0, reg.SectorSize);
+            if (read <= payloadOffset)
+            {
+                break;
+            }
+
+            Array.Clear(payload, 0, payload.Length);
+            int available = Math.Min(2048, read - payloadOffset);
+            Array.Copy(sector, payloadOffset, payload, 0, available);
+
+            if (!PsxRam.WriteBytes(psxAddress + (i * 2048), payload))
+            {
+                break;
+            }
+
+            delivered++;
+        }
+
+        return delivered;
+    }
+
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: turns the MSF position an original CdlLOC/CdlFILE carries into the LBA that
+    // ReadDataSectors resolves against the registry.
+    public static int LbaFromPosition(byte minute, byte second, byte sector) =>
+        ((FromBcd(minute) * 60) + FromBcd(second)) * 75 + FromBcd(sector) - 150;
 
     private static FileRegistration FindRegistrationContaining(int lba)
     {
