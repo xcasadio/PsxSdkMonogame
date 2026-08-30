@@ -168,20 +168,63 @@ public static class LibEtc
         return default;
     }
 
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: mirrors the u_long buffer that PadInit hands to the BIOS PAD_init vector and that
+    // PAD_dr refreshes. Active-low exactly like the hardware, so a set bit means released, and
+    // port 1 occupies the low halfword.
+    //
+    // Both facts are closed, not assumed. Verified live in PCSX-Redux while TITLE.EXE was the
+    // resident overlay: its buffer at 0x800920D4 reads 0xFFFFFFFF at rest and 0xFFFFF7FF with
+    // Start held, which puts Start at 0x0800 in the low halfword. That is also what makes the FMV
+    // players' `PadRead(1) & 0x800` test read as Start.
+    private static uint s_padBuffer = 0xFFFFFFFF;
+
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: PadInit stores its mode argument next to the buffer; kept so the observable state
+    // matches even though no desktop path reads it back yet.
+    private static int s_padMode;
+
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: stands for the BIOS pad driver being installed. PadStop tears it down, and the
+    // next overlay reinstalls it through PadInit, which is the sequence every
+    // ShutdownAndLoadExecutable performs.
+    private static bool s_padActive;
+
+    // GHIDRA: PadInit @ 0x8002B850 (SLPS_003.55), @ 0x8006FDA0 (TITLE.EXE)
     public static void PadInit(int mode)
     {
-        // Do nothing
+        s_padBuffer = 0xFFFFFFFF;
+        s_padMode = mode;
+        ResetCallback();
+        s_padActive = true;
     }
 
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: desktop stand-in for the BIOS PAD_dr vector, which refreshes the installed buffer
+    // from the controller. It consumes the snapshot the host sampled this frame instead of
+    // touching MonoGame from the runtime thread.
+    private static void PAD_dr()
+    {
+        if (s_padActive)
+        {
+            s_padBuffer = PadInputBackend.PublishedActiveLow;
+        }
+    }
+
+    // GHIDRA: PadRead @ 0x8002B8A0 (SLPS_003.55), @ 0x8006FDF0 (TITLE.EXE)
+    // The original ignores its id argument: it refreshes the shared buffer and returns the whole
+    // one's complement, both ports at once.
     public static uint PadRead(int id)
     {
-        // Do nothing
-        return default;
+        PAD_dr();
+        return ~s_padBuffer;
     }
 
+    // GHIDRA: PadStop @ 0x8002B8D0 (SLPS_003.55), @ 0x8006FE20 (TITLE.EXE)
     public static void PadStop()
     {
-        // Do nothing
+        s_padActive = false;
+        s_padBuffer = 0xFFFFFFFF;
     }
 
     public static void PadInitDirect(byte pad1, byte pad2)
