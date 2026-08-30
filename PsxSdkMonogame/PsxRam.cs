@@ -68,4 +68,24 @@ public static class PsxRam
     {
         WriteBytes(addr, new[] { (byte)value, (byte)(value >> 8) });
     }
+
+    // JUSTIFICATION: desktop adaptation helper — 32-bit counterparts of the 16-bit pair above.
+    // Needed as soon as a modelled PSX structure holds pointers or longs, which the TITLE.EXE task
+    // blocks do at +0x04, +0x08, +0x0C, +0x10 and +0x14.
+    public static int ReadI32(int addr)
+    {
+        byte[] b = ReadBytes(addr, 4);
+        return b == null ? 0 : b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);
+    }
+
+    public static void WriteI32(int addr, int value)
+    {
+        WriteBytes(addr, new[]
+        {
+            (byte)value,
+            (byte)(value >> 8),
+            (byte)(value >> 16),
+            (byte)(value >> 24),
+        });
+    }
 }
