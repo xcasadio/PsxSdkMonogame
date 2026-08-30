@@ -159,6 +159,19 @@ public static class LibApi
         // Do nothing
     }
 
+    // GHIDRA: InitHeap @ 0x80059160 (TITLE.EXE)
+    // The game reaches this overload, not the ulong[] one above: main @ 0x800581DC calls
+    // InitHeap(0x10000, 0x10000) with a raw PSX address, and FUN_80058a9c repeats it.
+    public static void InitHeap(int baseAddress, int size) => PsxHeap.InitHeap(baseAddress, size);
+
+    // GHIDRA: malloc @ 0x800591A0 (TITLE.EXE)
+    // Observable contract only; see PsxHeap for why this SDK routine is adapted rather than
+    // transliterated.
+    public static int malloc(int size) => PsxHeap.Malloc(size);
+
+    // GHIDRA: free @ 0x800593D4 (TITLE.EXE)
+    public static void free(int address) => PsxHeap.Free(address);
+
 
     public static int open(char[] devname,  int flag)
     {

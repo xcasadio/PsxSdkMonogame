@@ -12,6 +12,42 @@ public static class Kernel
 
     }
 
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: the BIOS pseudo-random generator's seed. On the console it lives at 0x000085EC in
+    // low RAM, outside the game image, which is why it is held here and not in a transliterated
+    // overlay. Both routines below reach it through `lui $v1, 0x0001` / +/-0x7A14 addressing.
+    private static uint s_randSeed;
+
+    // GHIDRA: srand @ 0x8006FC80 (TITLE.EXE)
+    // That address is only the A0(0x30) stub — `addiu $t2,$zero,0xA0` / `jr $t2` /
+    // `addiu $t1,$zero,0x30` — so there is no body in the game image. The body is the BIOS routine
+    // the vector resolves to, read at 0xBFC06254 through PCSX-Redux and transliterated here:
+    //   lui $v0, 0x0001 / jr $ra / sw $a0, -0x7a14($v0)
+    public static void srand(uint seed)
+    {
+        s_randSeed = seed;
+    }
+
+    // GHIDRA: rand @ 0x8006FD80 (TITLE.EXE)
+    // Same shape: the A0(0x2F) stub. Body read at 0xBFC06228 and transliterated instruction for
+    // instruction:
+    //   lw    $a0, seed
+    //   lui   $v0, 0x41c6 / addiu $v0, 0x4e6d      -> 0x41C64E6D = 1103515245
+    //   mult  $a0, $v0 / mflo $v0
+    //   addiu $v0, 0x3039                          -> 12345
+    //   sw    $v0, seed
+    //   srl   $v0, 0x10 / andi $v0, 0x7fff
+    // mflo keeps the low 32 bits of the product, which unchecked arithmetic reproduces exactly.
+    // The game relies on this: its combat AI draws `rand() % 0x65` in 49 places.
+    public static int rand()
+    {
+        unchecked
+        {
+            s_randSeed = (s_randSeed * 1103515245u) + 12345u;
+            return (int)((s_randSeed >> 16) & 0x7FFF);
+        }
+    }
+
     // GHIDRA: memset @ 0x80071a44
     // JUSTIFICATION: PSX hardware adaptation only — a BIOS A0 syscall, so there is no C body to
     // transliterate; the observable contract IS the implementation.

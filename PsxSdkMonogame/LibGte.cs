@@ -601,6 +601,40 @@ public static class LibGte
         gteOFY = ofy << 16;
     }
 
+    // GHIDRA: InitGeom @ 0x8006E1F0 (TITLE.EXE)
+    // The original enables COP2 in the Status register through _patch_gte/setCopReg, then loads
+    // seven control registers:
+    //   ZSF3 = 0x155, ZSF4 = 0x100, H = 1000, DQA = 0xFFFFEF9E, DQB = 0x1400000, OFX = 0, OFY = 0
+    // Enabling the coprocessor has no desktop equivalent: this GTE is a software model that is
+    // always available. The register loads do carry over, and they are what this reproduces.
+    // ZSF3 is not a field here — LibGte already pins it to InitGeom's 0x155, see the depth-cue
+    // note further down — and ZSF4 is not modelled at all.
+    public static void InitGeom()
+    {
+        LdH(1000);
+        gteDQA = -4194;
+        gteDQB = 0x1400000;
+        gteOFX = 0;
+        gteOFY = 0;
+    }
+
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: the FC (far colour) control register triplet, COP2 $21-$23.
+    // PARTIAL: stored so SetFarColor keeps its observable contract, but no GTE operation modelled
+    // here consumes FC yet — it feeds the depth-cue path (gte_dpcs/gte_dpct), which is not
+    // implemented. Reading these back is the only way to tell the value was received.
+    private static int gteRFC, gteGFC, gteBFC;
+
+    // GHIDRA: SetFarColor @ 0x8006D884 (TITLE.EXE)
+    // Raw disassembly is three `sll ,0x4` then `ldfcdir`, so the SDK macro shifts its plain
+    // arguments left by 4 before loading the control registers.
+    public static void SetFarColor(long rfc, long gfc, long bfc)
+    {
+        gteRFC = (int)rfc << 4;
+        gteGFC = (int)gfc << 4;
+        gteBFC = (int)bfc << 4;
+    }
+
     private static ushort SatZ(int v) => (ushort)(v > 0xFFFF ? 0xFFFF : v < 0 ? 0 : v);
     private static short SatSxy(int v) => (short)(v > 0x3FF ? 0x3FF : v < -0x400 ? -0x400 : v);
 
