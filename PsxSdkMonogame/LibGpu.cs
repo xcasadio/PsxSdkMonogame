@@ -2383,7 +2383,23 @@ public static class LibGpu
     // patch plus a one-colour CLUT is a standard PSX idiom for a flat-coloured textured primitive,
     // so this affected every model built that way, not just this one; a VRAM survey of the scene
     // found most loaded palettes hold a non-zero colour in slot 0.
-    private static bool SampleTexel(int tpage, int clut, int u, int v, out int r, out int g, out int b)
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: `stp` is bit 15 of the texel - the semi-transparency bit. On the hardware a TEXTURED
+    // primitive with the semi-transparency command bit set blends only the texels that carry it;
+    // the rest are drawn opaque. An UNTEXTURED primitive has no texel, so its command bit applies
+    // to every pixel.
+    //
+    // Ignoring it blended everything, and TITLE.EXE's own data shows how wrong that is. Every
+    // primitive its title screen submits carries code 0x2E, semi-transparent, yet the CLUTs
+    // disagree: the two background bands sample a single 0xFFFF texel the title task uploads
+    // itself, bit 15 SET, with abr = 2 (subtract) - that is how the black letterbox bars are made.
+    // The logo, PRESS START and the artwork sample 256-entry CLUTs whose non-zero entries have bit
+    // 15 CLEAR on all 255 and all 146 of them. Blending those halved the whole picture.
+    //
+    // For 4- and 8-bit textures the bit lives in the CLUT entry, for 15-bit ones in the texel
+    // itself; reading it off `color16` covers both, because that is the value each path resolves to.
+    private static bool SampleTexel(int tpage, int clut, int u, int v,
+        out int r, out int g, out int b, out bool stp)
     {
         // GP0(0xE2) texture window, applied here because the hardware applies it per sampled texel,
         // not at packet-build time. Masks are in units of 8 texels; mask 0 (the reset state, and
@@ -2420,12 +2436,14 @@ public static class LibGpu
         if (color16 == 0)
         {
             r = g = b = 0;
+            stp = false;
             return false;
         }
 
         r = (color16 & 0x1F) << 3;
         g = ((color16 >> 5) & 0x1F) << 3;
         b = ((color16 >> 10) & 0x1F) << 3;
+        stp = (color16 & 0x8000) != 0;
         return true;
     }
 
@@ -2447,7 +2465,7 @@ public static class LibGpu
             for (int px = x0; px < x1; px++)
             {
                 int u = u0 + (px - x);
-                if (!SampleTexel(tpage, clut, u, v, out int r, out int g, out int b))
+                if (!SampleTexel(tpage, clut, u, v, out int r, out int g, out int b, out bool stp))
                 {
                     continue;
                 }
@@ -2455,7 +2473,7 @@ public static class LibGpu
                 int outR = System.Math.Min(255, r * modR / 128);
                 int outG = System.Math.Min(255, g * modG / 128);
                 int outB = System.Math.Min(255, b * modB / 128);
-                PlotPixel(px, py, (byte)outR, (byte)outG, (byte)outB, semiTransparent, false);
+                PlotPixel(px, py, (byte)outR, (byte)outG, (byte)outB, semiTransparent && stp, false);
             }
         }
     }
@@ -2493,7 +2511,7 @@ public static class LibGpu
                 {
                     int u = (int)(((long)u0 * w0 + (long)u1 * w1 + (long)u2 * w2) / denom);
                     int v = (int)(((long)v0 * w0 + (long)v1 * w1 + (long)v2 * w2) / denom);
-                    if (!SampleTexel(tpage, clut, u, v, out int r, out int g, out int b))
+                    if (!SampleTexel(tpage, clut, u, v, out int r, out int g, out int b, out bool stp))
                     {
                         continue;
                     }
@@ -2501,7 +2519,7 @@ public static class LibGpu
                     int outR = System.Math.Min(255, r * modR / 128);
                     int outG = System.Math.Min(255, g * modG / 128);
                     int outB = System.Math.Min(255, b * modB / 128);
-                    PlotPixel(px, py, (byte)outR, (byte)outG, (byte)outB, semiTransparent, true);
+                    PlotPixel(px, py, (byte)outR, (byte)outG, (byte)outB, semiTransparent && stp, true);
                 }
             }
         }
@@ -2599,7 +2617,7 @@ public static class LibGpu
                     int denom = 4 * absArea;
                     int u = (int)(((long)u0 * w0 + (long)u1 * w1 + (long)u2 * w2) / denom);
                     int v = (int)(((long)v0 * w0 + (long)v1 * w1 + (long)v2 * w2) / denom);
-                    if (!SampleTexel(tpage, clut, u, v, out int r, out int g, out int b))
+                    if (!SampleTexel(tpage, clut, u, v, out int r, out int g, out int b, out bool stp))
                     {
                         continue;
                     }
@@ -2610,7 +2628,7 @@ public static class LibGpu
                     int outR = System.Math.Min(255, r * modR / 128);
                     int outG = System.Math.Min(255, g * modG / 128);
                     int outB = System.Math.Min(255, b * modB / 128);
-                    PlotPixel(px, py, (byte)outR, (byte)outG, (byte)outB, semiTransparent, true);
+                    PlotPixel(px, py, (byte)outR, (byte)outG, (byte)outB, semiTransparent && stp, true);
                 }
             }
         }
