@@ -305,6 +305,43 @@ public static class LibCd
         return fp;
     }
 
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: restores the disc-load latency the desktop adapter otherwise skips entirely.
+    //
+    // Measured on the real game in PCSX-Redux, off the cycle counter, between the call site of
+    // ShutdownAndLoadExecutable and the loaded overlay's main:
+    //
+    //   MOVIE.EXE  133 120 bytes   34 496 533 cycles  =  1018.5 ms
+    //   TITLE.EXE  942 080 bytes  123 154 369 cycles  =  3636.2 ms
+    //
+    // Solving those two gives 309 037 bytes/s over a 587.8 ms fixed cost. That transfer rate is
+    // the drive's real 2x speed (2 x 75 sectors/s x 2048 bytes = 307 200 B/s), so the model lands
+    // on the hardware specification instead of being fitted to taste.
+    //
+    // This is not cosmetic. With LoadExec instantaneous, one Start press skipped BOTH startup
+    // movies: the next overlay's first pad test ran 66 ms after the previous one's, far inside a
+    // human keypress. On console that gap is about 1.6 s. Holding Start throughout was checked on
+    // the console and skips both there too, so the transliterated code was already faithful — only
+    // this latency was missing.
+    private const double DiscBytesPerSecond = 309036.5;
+    private const double DiscSeekMilliseconds = 587.8;
+
+    public static void WaitDiscLoad(string isoPath)
+    {
+        long size = LibDs.DiscFileSize(isoPath);
+        if (size < 0)
+        {
+            return;
+        }
+
+        double milliseconds = DiscSeekMilliseconds + (size / DiscBytesPerSecond * 1000.0);
+        int frames = (int)Math.Round(milliseconds / (1000.0 / 60.0));
+        for (int i = 0; i < frames; i++)
+        {
+            LibEtc.VSync(0);
+        }
+    }
+
     public static int CdRead(int sectors, ulong[] buf, int mode)
     {
         /* Do nothing */

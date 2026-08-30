@@ -266,6 +266,20 @@ public static class LibDs
     // JUSTIFICATION: PSX hardware adaptation only
     // RELATION: turns the MSF position an original CdlLOC/CdlFILE carries into the LBA that
     // ReadDataSectors resolves against the registry.
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: size in bytes of a disc file, or -1 when the path resolves to nothing. Used to
+    // model how long the drive would have taken to read it.
+    public static long DiscFileSize(string isoPath)
+    {
+        string hostPath = DiscFileResolver?.Invoke(isoPath);
+        if (hostPath == null || !File.Exists(hostPath))
+        {
+            return -1;
+        }
+
+        return new FileInfo(hostPath).Length;
+    }
+
     public static int LbaFromPosition(byte minute, byte second, byte sector) =>
         ((FromBcd(minute) * 60) + FromBcd(second)) * 75 + FromBcd(sector) - 150;
 
