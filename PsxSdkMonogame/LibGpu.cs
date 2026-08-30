@@ -1606,6 +1606,36 @@ public static class LibGpu
         return buffer;
     }
 
+    // JUSTIFICATION: PSX hardware adaptation only — withdraws a buffer's declared address.
+    // RELATION: needed because a region can be REPLACED rather than merely re-based. RamRegion
+    // matches on ReferenceEquals, so registering a different array for an address a live row
+    // already claims adds a SECOND row, and RamResolve's tie-break is a strict `>` on the base:
+    // with two rows sharing one base the first one found wins for ever, so the stale buffer keeps
+    // answering and the new one is unreachable. On top of that the registry is a fixed 64 rows, so
+    // a caller that re-arms in a loop exhausts it.
+    // PsxHeap.InitHeap is exactly that caller: TITLE.EXE re-arms the heap once per pass through
+    // main's loop, at FUN_80058a9c @ 0x80058A9C.
+    public static void RamRelease(byte[] buffer)
+    {
+        if (buffer == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < s_ramRegionCount; i++)
+        {
+            if (ReferenceEquals(s_ramRegionBuffer[i], buffer))
+            {
+                s_ramRegionCount--;
+                s_ramRegionBuffer[i] = s_ramRegionBuffer[s_ramRegionCount];
+                s_ramRegionBase[i] = s_ramRegionBase[s_ramRegionCount];
+                s_ramRegionBuffer[s_ramRegionCount] = null;
+                s_ramRegionBase[s_ramRegionCount] = 0;
+                return;
+            }
+        }
+    }
+
     // JUSTIFICATION: PSX hardware adaptation only — the PSX address of (buffer, offset), i.e. what
     // the original's `(uint)p2` already is. Returns 0 for a buffer that has not declared an
     // address; 0 is not a legal PSX RAM address, so callers use it as "not addressable".

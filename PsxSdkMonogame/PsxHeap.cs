@@ -59,7 +59,21 @@ public static class PsxHeap
         }
 
         s_baseAddress = baseAddress;
-        s_storage = new byte[size];
+
+        // JUSTIFICATION: PSX hardware adaptation only
+        // RELATION: InitHeap allocates nothing on the console - it records a base and a size over
+        // RAM that already exists - so re-arming must not leave the previous span registered.
+        // Keeping the same array when the size is unchanged is the whole of it for TITLE.EXE,
+        // which arms 0x10000 bytes both times; the release covers a size change.
+        if (s_storage.Length == size)
+        {
+            System.Array.Clear(s_storage, 0, s_storage.Length);
+        }
+        else
+        {
+            LibGpu.RamRelease(s_storage);
+            s_storage = new byte[size];
+        }
 
         // JUSTIFICATION: PSX hardware adaptation only
         // RELATION: the heap is a span of PSX RAM like any other, so it declares its address to
