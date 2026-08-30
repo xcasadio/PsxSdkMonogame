@@ -77,21 +77,24 @@ public static class LibGpu
         short x3, y3;
     } // 0x28
 
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: the vertex, colour and UV fields were left private, so no transliterated call site
+    // could fill one. FUN_80058d64 @ 0x80058D64 writes every one of them by hand.
     public class POLY_FT4
     {
         public ulong tag;
-        byte r0, g0, b0, code;
-        short x0, y0;
-        byte u0, v0;
+        public byte r0, g0, b0, code;
+        public short x0, y0;
+        public byte u0, v0;
         public ushort clut;
-        short x1, y1;
-        byte u1, v1;
+        public short x1, y1;
+        public byte u1, v1;
         public ushort tpage;
-        short x2, y2;
-        byte u2, v2;
+        public short x2, y2;
+        public byte u2, v2;
         public ushort pad1;
-        short x3, y3;
-        byte u3, v3;
+        public short x3, y3;
+        public byte u3, v3;
         public ushort pad2;
     } // 0x2C
 
