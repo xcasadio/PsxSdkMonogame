@@ -146,10 +146,211 @@ public static class LibCd
         return CdlComplete;
     }
 
+    // =======================================================================================
+    // CdReady / CD_ready — the drive's response-FIFO poll
+    // =======================================================================================
+    //
+    // CLOSED 2026-08-30 from /SELECT.EXE. CdReady @ 0x80044440 is 32 bytes and does nothing but
+    // `return CD_ready(mode, result);`. Its one caller in the image is FUN_80025788 @ 0x800257AC,
+    // the per-frame CD-DA service, as `CdReady(1, &DAT_80055AD4)`.
+    //
+    // WHAT IT REPORTS. CD_ready polls the two interrupt codes libcd's CD interrupt handler keeps
+    // and, when one is pending, copies that interrupt's eight-byte response block into the caller's
+    // buffer and returns the code. The codes are the libcd CdlIntr set — 0 CdlNoIntr,
+    // 1 CdlDataReady, 2 CdlComplete, 3 CdlAcknowledge, 4 CdlDataEnd, 5 CdlDiskError. FUN_80025788's
+    // `DAT_80055aac == 1` test is therefore "a CdlDataReady arrived": the once-per-second report
+    // packet the drive emits while playing CD-DA with CdlModeRept set, whose result[1] is the BCD
+    // track number. FUN_800258f0 @ 0x800258F0 is what turns that on — CdlSetmode with the mode byte
+    // at DAT_80055AD0 = 5 = CdlModeDA | CdlModeRept.
+    //
+    // THE RETURN CONTRACT IS DECODED FROM THE BYTES at 0x800454F0..0x80045597, read out of the
+    // image with read-memory, not from the decompiler — Ghidra renders all four exits as calls to
+    // the epilogue fragments it names BIOS_OBJ_900 / BIOS_OBJ_A58 / BIOS_OBJ_A68, which hides the
+    // value entirely. The four instructions that actually set v0 are:
+    //     0x8004553C  00 C0 10 21  addu v0,a2,zero   delay slot of `j 0x80045598`, taken after the
+    //                                                sync-result copy: returns DAT_800506E2
+    //     0x8004558C  00 C0 10 21  addu v0,a2,zero   the same, after the ready-result copy:
+    //                                                returns DAT_800506E1
+    //     0x80045594  00 00 10 21  addu v0,zero,zero delay slot of `beq s7,zero,0x8004536C`
+    //                                                (s7 = mode): mode != 0 returns 0
+    //     0x80045428  24 02 FF FF  addiu v0,zero,-1  delay slot of the timeout's jump: returns -1
+    // In both copy paths a2 holds the code read BEFORE the `sb zero` that clears it (0x800454F8 and
+    // 0x80045548 respectively), so what comes back is the pending code, not the cleared one. The
+    // copy is also skipped, but the return value kept, when the caller passes a NULL buffer — both
+    // `beq` instructions branch to the same `addu v0,a2,zero`.
+    //
+    // PARTIAL, AND THIS IS THE WHOLE ANSWER TO "DOES THE MUSIC LOOP NOW": IT DOES NOT.
+    // DAT_800506E1 and DAT_800506E2 are written only by libcd's CD interrupt handler, out of the
+    // drive's response FIFO. This port models neither — CD_cw above says so in its own note, and
+    // leaves the result buffer untouched for exactly that reason. Both bytes therefore stay at the
+    // link-time 0 that read-memory reports at 0x800506E0 (eight zero bytes), so CdReady(1, ...)
+    // falls straight through to `if (param_1 != 0) return 0;` on its first loop iteration and
+    // answers CdlNoIntr for ever. DAT_80055AAC stays 0, FUN_80025788's `== 1` still fails, and the
+    // track-advance branch is still dead. What changed is only that the 0 is now produced by the
+    // transliterated control flow instead of asserted by a stub.
+    //
+    // WHAT WOULD CLOSE IT: a desktop CD-DA playback path that knows which track is playing, plus a
+    // response-FIFO model in CD_cw so a CdlModeRept report packet can reach DAT_80056874. Neither
+    // exists in this port — CD_cw discards CdlPlay (0x03) outright, and nothing reads data/tracks.
+
+    // GHIDRA: DAT_800506E1 @ 0x800506E1 (SELECT.EXE)
+    // The pending "ready" interrupt code. Link-time 0 — read-memory over 0x800506E0 returns eight
+    // zero bytes. Only libcd's CD interrupt handler writes it; this port has no interrupt path.
+    private static byte DAT_800506e1 = 0;
+
+    // GHIDRA: DAT_800506E2 @ 0x800506E2 (SELECT.EXE)
+    // The pending "sync" interrupt code. Same writer, same link-time 0.
+    private static byte DAT_800506e2 = 0;
+
+    // GHIDRA: DAT_80056874 @ 0x80056874 (SELECT.EXE)
+    // The eight-byte response block belonging to the ready interrupt. .bss — read-memory refuses
+    // the address, which is what places it past the end of the loaded image — so it is zero after
+    // start's .bss clear, and nothing in this port ever writes it.
+    private static readonly byte[] DAT_80056874 = new byte[8];
+
+    // GHIDRA: DAT_8005687C @ 0x8005687C (SELECT.EXE)
+    // The same, for the sync interrupt. Also .bss, also never written here.
+    private static readonly byte[] DAT_8005687c = new byte[8];
+
+    // GHIDRA: DAT_80056884 @ 0x80056884 (SELECT.EXE)
+    // .bss. The V-BLANK count CD_ready gives up at: VSync(-1) + 0x1E0, i.e. 480 fields = 8 seconds.
+    private static int DAT_80056884;
+
+    // GHIDRA: DAT_80056888 @ 0x80056888 (SELECT.EXE)
+    // .bss. The other half of the same watchdog — a spin counter that trips above 0x1E0000. It is
+    // what actually ends the mode == 0 wait in this port, because LibEtc.VSync(-1) only reads the
+    // V-BLANK counter and nothing inside this loop yields a frame, so the count never advances.
+    private static int DAT_80056888;
+
+    // GHIDRA: DAT_8005688C @ 0x8005688C (SELECT.EXE)
+    // .bss. The `char *` naming whichever libcd wait routine is spinning, printed by the timeout
+    // diagnostic. Held as a C# string rather than a pointer into the image's literal pool.
+    //
+    // The compiler flags it CS0414, "assigned but never used", and the flag is true of THIS PORT
+    // rather than of the original: its one reader is the second printf of CD_ready's timeout
+    // branch, which is left unemitted because its other three operands come from libcd name tables
+    // this port does not carry (see the note at that line). The store is kept because the original
+    // makes it, so the warning is suppressed for this one field and the build stays as it was.
+#pragma warning disable CS0414
+    private static string DAT_8005688c;
+#pragma warning restore CS0414
+
+    // GHIDRA: CD_ready @ 0x800452F8 (SELECT.EXE)
+    // PARTIAL: control flow and return contract closed (see the block above); the interrupt half
+    // has no desktop counterpart and is marked where it stood.
+    private static int CD_ready(int param_1, byte[] param_2)
+    {
+        bool bVar3;
+        int iVar4;
+        uint uVar6;
+
+        iVar4 = LibEtc.VSync(-1);
+        DAT_80056884 = iVar4 + 0x1e0;
+        DAT_80056888 = 0;
+        DAT_8005688c = "CD_ready";
+        while (true)
+        {
+            iVar4 = LibEtc.VSync(-1);
+
+            // The original writes the watchdog as one `||` whose right operand is a comma
+            // expression: `(DAT_80056884 < iVar4) || (iVar4 = DAT_80056888 + 1,
+            // bVar3 = 0x1e0000 < DAT_80056888, DAT_80056888 = iVar4, bVar3)`. Spelled out here
+            // because C# has no comma operator in that position; both properties are kept — the
+            // spin counter is incremented ONLY when the V-BLANK test fails, and the comparison
+            // reads the value from before that increment.
+            bVar3 = DAT_80056884 < iVar4;
+            if (!bVar3)
+            {
+                iVar4 = DAT_80056888 + 1;
+                bVar3 = 0x1e0000 < DAT_80056888;
+                DAT_80056888 = iVar4;
+            }
+
+            if (bVar3)
+            {
+                Console.WriteLine("CD timeout: ");
+
+                // PARTIAL: the diagnostic's second line is
+                //   printf("%s:(%s) Sync=%s, Ready=%s\n", DAT_8005688c,
+                //          (&PTR_s_CdlSync_80050428)[DAT_80050425],
+                //          (&PTR_s_NoIntr_800504A8)[DAT_800506E0],
+                //          (&PTR_s_NoIntr_800504A8)[DAT_800506E1]);
+                // Its three indexed operands come out of libcd's command-name and interrupt-name
+                // tables at 0x80050428 and 0x800504A8 — the same tables CdComstr and CdIntstr above
+                // read, and both of those are still stubs. Left unemitted rather than replaced by a
+                // differently shaped diagnostic.
+
+                // BLOCKED: CD_flush @ 0x80045BC8 stands here. It resets the drive's command queue
+                // and its pending interrupts; there is no drive and no queue in this port, and it
+                // is a different routine from the public CdFlush stub above.
+
+                return -1;
+            }
+
+            if (LibEtc.CheckCallback() != 0)
+            {
+                // BLOCKED: the interrupt drain — `bVar1 = *PTR_CDROM_REG0_800506C8;`, then a
+                // `while ((uVar6 = getintr()) != 0)` loop dispatching DAT_80050408 (the
+                // CdReadyCallback hook) with DAT_800506E1/&DAT_80056874 and DAT_80050404 (the
+                // CdSyncCallback hook) with DAT_800506E0/&DAT_8005686C, then
+                // `*PTR_CDROM_REG0_800506C8 = bVar1 & 3;`. All of it is the CD controller's own
+                // register interface, which this port does not model. Unreachable here in any
+                // case: LibEtc.CheckCallback is itself a "Do nothing" stub returning 0.
+            }
+
+            if (DAT_800506e2 != 0)
+            {
+                break;
+            }
+
+            if (DAT_800506e1 != 0)
+            {
+                uVar6 = DAT_800506e1;
+                DAT_800506e1 = 0;
+                if (param_2 != null)
+                {
+                    // The original copies eight bytes unconditionally. C# cannot reproduce the
+                    // overrun a shorter buffer would cause on console; every call site in this port
+                    // passes the eight-byte libcd result block, so the copy is written as it is.
+                    for (iVar4 = 0; iVar4 < 8; iVar4++)
+                    {
+                        param_2[iVar4] = DAT_80056874[iVar4];
+                    }
+                }
+
+                return (int)uVar6;
+            }
+
+            if (param_1 != 0)
+            {
+                return 0;
+            }
+        }
+
+        uVar6 = DAT_800506e2;
+        DAT_800506e2 = 0;
+        if (param_2 != null)
+        {
+            for (iVar4 = 0; iVar4 < 8; iVar4++)
+            {
+                param_2[iVar4] = DAT_8005687c[iVar4];
+            }
+        }
+
+        return (int)uVar6;
+    }
+
+    // GHIDRA: CdReady @ 0x80044440 (SELECT.EXE)
+    // The whole body: `iVar1 = CD_ready(); return iVar1;`. Ghidra loses the two arguments because
+    // the call is a plain `jal` with a0/a1 already in place; the prototype it carries,
+    // `int CdReady(int mode, u_char *result)`, and CD_ready's own use of s7 (mode) and s4 (result)
+    // put them back.
     public static int CdReady(int mode, byte[] result)
     {
-        /* Do nothing */
-        return default;
+        int iVar1;
+
+        iVar1 = CD_ready(mode, result);
+        return iVar1;
     }
 
     public static CdlCB CdSyncCallback(CdlCB func)
@@ -597,10 +798,168 @@ public static class LibCd
         return default;
     }
 
-    public static int CdGetToc(CdlLOC loc)
+    // =======================================================================================
+    // CdGetToc / CdGetToc2 — the disc's table of contents
+    // =======================================================================================
+    //
+    // CLOSED 2026-08-30 from /SELECT.EXE. CdGetToc @ 0x80047808 is 36 bytes and does nothing but
+    // `return CdGetToc2(1, loc);`. Its one caller in the image is FUN_80025658 @ 0x800256B4, the
+    // CD-DA bring-up, as `CdGetToc((CdlLOC *)&DAT_80055CEC)` — the 32-entry TOC array.
+    //
+    // WHAT CdGetToc2 @ 0x8004782C DOES, in order:
+    //   * saves and clears the CdSyncCallback hook, so no callback fires mid-enumeration;
+    //   * CdControlB(0x13 = CdlGetTN) -> result[1] is the first track number, result[2] the last,
+    //     both packed BCD; the routine decodes them into uVar6/uVar7 straight away;
+    //   * CdControlB(0x14 = CdlGetTD) with parameter 0 -> the LEAD-OUT position, stored as entry 0;
+    //   * CdControlB(0x14) once per track from first to last, each answer stored as the next entry.
+    // Every entry is written as minute = result[1], second = result[2], sector = 0, and the fourth
+    // byte — CdlLOC.track — is NEVER written, exactly as CdIntToPos above leaves it alone.
+    //
+    // THE RETURN VALUE is decoded from 0x800479F0: `08 01 1E 8A  j 0x80047A28` with
+    // `02 20 10 21  addu v0,s1,zero` in the delay slot, s1 being the counter the decompiler calls
+    // iVar3. It starts at 1 for the lead-out entry and is incremented once per CdlGetTD attempt,
+    // INCLUDING the attempt that fails and jumps to the error tail — which discards it and returns
+    // 0 instead. So the success value is 1 + (last - first + 1). FUN_80025658 keeps it as
+    // `DAT_80055AB0 = CdGetToc(...) - 1`.
+    //
+    // BLOCKED — THE TOC IS NOT RECOVERABLE IN THIS PORT, AND NOTHING BELOW INVENTS ONE.
+    // Every byte this routine stores comes from the drive's response FIFO, which CD_cw above does
+    // not model: it accepts commands 0x13 and 0x14 and returns success, but leaves the result
+    // buffer alone. So the transliterated body below runs to completion and produces
+    // first = last = 0, one loop iteration, a return of 2, and a TOC whose entries are all
+    // 00:00:00. The control flow is the original's; the data is absent, and is reported absent.
+    //
+    // The disc's real TOC cannot be derived from what this port has either:
+    //   * the port reads extracted files through LibDs.DiscFileResolver and assigns them synthetic
+    //     base LBAs in LibDs.RegisterFile (first = 150, then previous + sectors + 32 guard). That
+    //     registry is a read-addressing scheme, not the disc layout;
+    //   * data/tracks holds the CD-DA rip as WAV, numbered [2]..[20] — durations, not positions.
+    //     Turning those into MSF track starts needs the length of data track 1, which is the ISO's
+    //     whole data area and is not present here (data/ holds the extracted files);
+    //   * no .cue, .toc or .ccd exists anywhere in the repository.
+    // Smallest next step: a real disc image or its cue sheet, at which point the TOC becomes a
+    // read rather than a guess.
+    //
+    // HAZARD WORTH RECORDING, not introduced here and not repaired here: an all-zero TOC entry fed
+    // to CdlSetloc/CdlPlay makes CD_cw latch s_lastSeekTarget at 00:00:00, which is LBA -150, which
+    // LibDs.FindRegistrationContaining resolves to nothing — a following CdRead would return 0 for
+    // ever inside ReadCDData's `while (CdRead(...) != 1)`. FUN_80025658 and FUN_800258F0 are still
+    // BLOCKED stubs in SELECT_EXE/SelectScreen.cs, so nothing reaches it today, and the array they
+    // would pass was already zero-filled before this change.
+
+    // GHIDRA: DAT_80050410 @ 0x80050410 (SELECT.EXE)
+    // libcd's debug level, the value CdSetDebug stores. Link-time 0, read with read-memory, and
+    // CdSetDebug is still a stub here — so every diagnostic gated on it below is dead in the image
+    // as well as in the port. Transliterated because the gates are part of the control flow.
+    private static int DAT_80050410 = 0;
+
+    // GHIDRA: CdGetToc2 @ 0x8004782C (SELECT.EXE)
+    // PARTIAL: control flow and return contract closed; the TOC bytes themselves have no desktop
+    // source (see the block above).
+    //
+    // The original walks a `byte *` in strides of four; `param_2` here is the CdlLOC[] the caller
+    // already holds, and the two pointer cursors become entry indices — pbVar1 the write cursor,
+    // p2 the cursor the trailing diagnostic destroys. param_1 is genuinely unread in the body: the
+    // image's only caller passes 1 and no instruction between 0x8004782C and 0x80047A27 touches a0.
+    public static int CdGetToc2(int param_1, CdlLOC[] param_2)
     {
-        /* Do nothing */
-        return default;
+        byte bVar2;
+        CdlCB func;
+        int iVar3;
+        int iVar4;
+        uint uVar6;
+        uint uVar7;
+        int pbVar1;
+        int p2;
+        byte[] local_30 = new byte[8];
+        byte[] uStack_28 = new byte[8];
+
+        local_30[0] = 1;
+        func = CdSyncCallback(null);
+        iVar3 = CdControlB(0x13, null, uStack_28);
+        if (iVar3 != 0)
+        {
+            uVar6 = (uint)(uStack_28[1] >> 4) * 10 + (uint)(uStack_28[1] & 0xf);
+            uVar7 = (uint)(uStack_28[2] >> 4) * 10 + (uint)(uStack_28[2] & 0xf);
+            if (1 < DAT_80050410)
+            {
+                Console.WriteLine("track=" + uVar6 + "," + uVar7);
+            }
+
+            local_30[0] = 0;
+            iVar3 = CdControlB(0x14, local_30, uStack_28);
+            if (iVar3 != 0)
+            {
+                param_2[0].minute = uStack_28[1];
+                param_2[0].sector = 0;
+                param_2[0].second = uStack_28[2];
+                iVar3 = 1;
+                pbVar1 = 0;
+                if (uVar6 <= uVar7)
+                {
+                    do
+                    {
+                        // Binary to packed BCD, the same `v + (v / 10) * 6` identity CdIntToPos
+                        // above uses, and in the original it is done in eight bits.
+                        local_30[0] = (byte)(uVar6 + (uVar6 / 10) * 6);
+                        iVar4 = CdControlB(0x14, local_30, uStack_28);
+                        iVar3 = iVar3 + 1;
+                        if (iVar4 == 0)
+                        {
+                            goto TOC_OBJ_1F0;
+                        }
+
+                        param_2[pbVar1 + 1].minute = uStack_28[1];
+                        uVar6 = uVar6 + 1;
+                        param_2[pbVar1 + 1].sector = 0;
+                        param_2[pbVar1 + 1].second = uStack_28[2];
+                        pbVar1 = pbVar1 + 1;
+                    } while ((int)uVar6 <= (int)uVar7);
+                }
+
+                if (1 < DAT_80050410)
+                {
+                    iVar4 = 0;
+                    if (-1 < iVar3 + -1)
+                    {
+                        p2 = 0;
+                        do
+                        {
+                            bVar2 = param_2[p2].minute;
+                            iVar4 = iVar4 + 1;
+                            Console.WriteLine(
+                                "CdGetToc2: " + bVar2.ToString("x2") + ":" +
+                                param_2[p2].second.ToString("x2") + ":00");
+                            p2 = p2 + 1;
+                        } while (iVar4 <= iVar3 + -1);
+                    }
+                }
+
+                CdSyncCallback(func);
+                return iVar3;
+            }
+        }
+
+    TOC_OBJ_1F0:
+        if (DAT_80050410 != 0)
+        {
+            Console.WriteLine("CdGetToc2: error");
+        }
+
+        CdSyncCallback(func);
+        return 0;
+    }
+
+    // GHIDRA: CdGetToc @ 0x80047808 (SELECT.EXE)
+    // The parameter was `CdlLOC loc` before this tranche, a single entry. The original's `CdlLOC *`
+    // is the head of the caller's 32-entry array — FUN_80025658 passes &DAT_80055CEC and then walks
+    // it with `p = p + 1` — so the port takes the array. Nothing called the old single-entry form.
+    public static int CdGetToc(CdlLOC[] loc)
+    {
+        int iVar1;
+
+        iVar1 = CdGetToc2(1, loc);
+        return iVar1;
     }
 
     public static CdlCB CdDataCallback(CdlCB func)
