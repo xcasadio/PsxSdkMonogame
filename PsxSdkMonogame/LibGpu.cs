@@ -3684,6 +3684,66 @@ public static class LibGpu
         buf[byteOffset + 7] = 0x38;
     }
 
+    // GHIDRA: SetPolyF3 @ 0x800711E0 (TITLE.EXE)
+    // CERTAIN: both constants read straight off the two-store body,
+    // `ori $v0,0x04 / sb $v0,3($a0)` then `ori $v0,0x20 / sb $v0,7($a0)`.
+    // Buffer form, for primitives living in a malloc'd pool rather than as objects.
+    public static void SetPolyF3(byte[] buf, int byteOffset)
+    {
+        buf[byteOffset + 3] = 4;
+        buf[byteOffset + 7] = 0x20;
+    }
+
+    // GHIDRA: SetPolyFT3 @ 0x800711F4 (TITLE.EXE)
+    // CERTAIN: both constants read straight off the two-store body,
+    // `ori $v0,0x07 / sb $v0,3($a0)` then `ori $v0,0x24 / sb $v0,7($a0)`.
+    // Buffer form, for primitives living in a malloc'd pool rather than as objects.
+    public static void SetPolyFT3(byte[] buf, int byteOffset)
+    {
+        buf[byteOffset + 3] = 7;
+        buf[byteOffset + 7] = 0x24;
+    }
+
+    // GHIDRA: SetPolyGT3 @ 0x8007121C (TITLE.EXE)
+    // CERTAIN: both constants read straight off the two-store body,
+    // `ori $v0,0x09 / sb $v0,3($a0)` then `ori $v0,0x34 / sb $v0,7($a0)`.
+    // Buffer form, for primitives living in a malloc'd pool rather than as objects.
+    public static void SetPolyGT3(byte[] buf, int byteOffset)
+    {
+        buf[byteOffset + 3] = 9;
+        buf[byteOffset + 7] = 0x34;
+    }
+
+    // GHIDRA: SetPolyF4 @ 0x80071230 (TITLE.EXE)
+    // CERTAIN: both constants read straight off the two-store body,
+    // `ori $v0,0x05 / sb $v0,3($a0)` then `ori $v0,0x28 / sb $v0,7($a0)`.
+    // Buffer form, for primitives living in a malloc'd pool rather than as objects.
+    public static void SetPolyF4(byte[] buf, int byteOffset)
+    {
+        buf[byteOffset + 3] = 5;
+        buf[byteOffset + 7] = 0x28;
+    }
+
+    // GHIDRA: SetPolyFT4 @ 0x80071244 (TITLE.EXE)
+    // CERTAIN: both constants read straight off the two-store body,
+    // `ori $v0,0x09 / sb $v0,3($a0)` then `ori $v0,0x2C / sb $v0,7($a0)`.
+    // Buffer form, for primitives living in a malloc'd pool rather than as objects.
+    public static void SetPolyFT4(byte[] buf, int byteOffset)
+    {
+        buf[byteOffset + 3] = 9;
+        buf[byteOffset + 7] = 0x2C;
+    }
+
+    // GHIDRA: SetPolyGT4 @ 0x8007126C (TITLE.EXE)
+    // CERTAIN: both constants read straight off the two-store body,
+    // `ori $v0,0x0C / sb $v0,3($a0)` then `ori $v0,0x3C / sb $v0,7($a0)`.
+    // Buffer form, for primitives living in a malloc'd pool rather than as objects.
+    public static void SetPolyGT4(byte[] buf, int byteOffset)
+    {
+        buf[byteOffset + 3] = 12;
+        buf[byteOffset + 7] = 0x3C;
+    }
+
     // GHIDRA: SetSemiTrans — the psyq macro `p->code |= 2` (no standalone function; it is inlined at
     // every call site, e.g. Render3DRotatedPointWithOutline 0x800d27fc).
     // The `abe == 0` case clears the bit, matching the macro's documented contract; every call site
