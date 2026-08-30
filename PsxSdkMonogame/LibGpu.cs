@@ -616,9 +616,22 @@ public static class LibGpu
     // Not installed -> no-op, matching DrawOTag(OT_TYPE) above.
     public static Action<int> DrawOTagIntHandler;
 
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: with no handler installed this used to do nothing at all, so a game that reached
+    // the address form got no drawing and no diagnostic. It now falls back to the same software
+    // rasterizer DrawOTagEnv uses, which is what the hardware does with the same argument.
     public static void DrawOTag(int otagBase)
     {
-        DrawOTagIntHandler?.Invoke(otagBase);
+        if (DrawOTagIntHandler != null)
+        {
+            DrawOTagIntHandler.Invoke(otagBase);
+            return;
+        }
+
+        if (RamResolve(otagBase, out byte[] ot, out int offset))
+        {
+            RasterizeOrderingTable(ot, offset);
+        }
     }
 
     /**
@@ -2979,6 +2992,47 @@ public static class LibGpu
     public static byte[] ClearOTagR(byte[] ot, int n)
     {
         return ClearOTagR(ot, 0, n);
+    }
+
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: the forward form of the same routine. ClearOTagR links each bucket back to its
+    // predecessor, so a walk runs from the tail; ClearOTag links each to its SUCCESSOR, so the walk
+    // runs from ot[0] forward and the last bucket terminates. RunFrameLoop @ 0x800587A8 uses this
+    // one — ClearOTag(&DAT_800a6830, 0x800) then DrawOTag on that same first entry — and only the
+    // OT_TYPE stub existed, so its table was never linked and its walk ended immediately.
+    // Each word keeps its top byte, which is the entry length and stays 0 for a bare bucket.
+    public static byte[] ClearOTag(byte[] ot, int baseOffset, int n)
+    {
+        if (ot == null || n <= 0 || baseOffset < 0)
+        {
+            return ot;
+        }
+
+        int last = System.Math.Min(n, (ot.Length - baseOffset) / 4);
+        for (int i = 0; i < last - 1; i++)
+        {
+            WriteU32(ot, baseOffset + (i * 4),
+                (uint)RamAddressOf(ot, baseOffset + ((i + 1) * 4)) & 0x00ffffff);
+        }
+
+        if (last > 0)
+        {
+            WriteU32(ot, baseOffset + ((last - 1) * 4), 0x00ffffff);
+        }
+
+        return ot;
+    }
+
+    public static byte[] ClearOTag(byte[] ot, int n) => ClearOTag(ot, 0, n);
+
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: address form, for a call site holding the table's PSX address rather than the array.
+    public static void ClearOTag(int otagBase, int n)
+    {
+        if (RamResolve(otagBase, out byte[] ot, out int offset))
+        {
+            ClearOTag(ot, offset, n);
+        }
     }
 
     // JUSTIFICATION: C# language bridge only — the body shared by the two overloads, which differ
