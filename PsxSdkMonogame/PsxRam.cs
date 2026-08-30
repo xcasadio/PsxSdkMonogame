@@ -58,6 +58,20 @@ public static class PsxRam
         return true;
     }
 
+    // JUSTIFICATION: desktop adaptation helper — the byte pair of the two below. The original
+    // clears sixteen single bytes of shared high RAM through a decrementing pointer in
+    // FUN_80021e28 @ 0x80021E28, which has no wider form to borrow.
+    public static byte ReadU8(int addr)
+    {
+        byte[] b = ReadBytes(addr, 1);
+        return b == null ? (byte)0 : b[0];
+    }
+
+    public static void WriteU8(int addr, byte value)
+    {
+        WriteBytes(addr, new[] { value });
+    }
+
     public static ushort ReadU16(int addr)
     {
         byte[] b = ReadBytes(addr, 2);

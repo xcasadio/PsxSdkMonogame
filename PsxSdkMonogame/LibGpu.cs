@@ -3840,4 +3840,60 @@ public static class LibGpu
             buf[byteOffset + 7] &= 0xfd;
         }
     }
+
+    // GHIDRA: SetShadeTex @ 0x800711B8
+    // A real function in this build, not the inlined psyq macro. Its body, read from the image:
+    //   beq a1,zero,+4 / lbu v0,7(a0) / j end / ori v0,v0,1      -- tge != 0
+    //   lbu v0,7(a0) / andi v0,v0,0xfe                           -- tge == 0
+    //   end: jr ra / sb v0,7(a0)
+    // Bit 0 of code is the GPU's raw-texture bit, so tge selects unshaded texture.
+    // Buffer form, for primitives living in memory rather than as objects.
+    public static void SetShadeTex(byte[] buf, int byteOffset, int tge)
+    {
+        if (tge != 0)
+        {
+            buf[byteOffset + 7] |= 1;
+        }
+        else
+        {
+            buf[byteOffset + 7] &= 0xfe;
+        }
+    }
+
+    // JUSTIFICATION: C# language bridge only
+    // RELATION: the same four routines against a packet named through POLY_FT4Ref / POLY_GT4Ref.
+    // These overloads are not optional: without them a ref struct binds to the `object` overloads
+    // above, which are the do-nothing SDK stubs, and every call would silently tag nothing.
+    public static void SetPolyFT4(POLY_FT4Ref p) => SetPolyFT4(p.Buf, p.Offset);
+
+    public static void SetPolyGT4(POLY_GT4Ref p) => SetPolyGT4(p.Buf, p.Offset);
+
+    public static void SetSemiTrans(POLY_FT4Ref p, int abe) => SetSemiTrans(p.Buf, p.Offset, abe);
+
+    public static void SetSemiTrans(POLY_GT4Ref p, int abe) => SetSemiTrans(p.Buf, p.Offset, abe);
+
+    public static void SetShadeTex(POLY_FT4Ref p, int tge) => SetShadeTex(p.Buf, p.Offset, tge);
+
+    public static void SetShadeTex(POLY_GT4Ref p, int tge) => SetShadeTex(p.Buf, p.Offset, tge);
+
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: the address form of AddPrim @ 0x80077AC4, which is how the game actually calls it:
+    // FUN_80037388 @ 0x80037388 spells the bucket as `DAT_800834e0 + 0x206c` and hands over
+    // `&POLY_GT4_800b9518`. Both operands are raw PSX addresses there, not cursors, so both are
+    // resolved here and the splice itself is the buffer overload's.
+    public static void AddPrim(int otAddress, int primAddress)
+    {
+        if (RamResolve(otAddress, out byte[] otBuf, out int otOffset)
+            && RamResolve(primAddress, out byte[] primBuf, out int primOffset))
+        {
+            AddPrim(otBuf, otOffset, primBuf, primOffset);
+        }
+    }
+
+    // JUSTIFICATION: C# language bridge only
+    // RELATION: the bucket stays an address, as the original computes it, while the packet is
+    // already named.
+    public static void AddPrim(int otAddress, POLY_FT4Ref p) => AddPrim(otAddress, p.Address);
+
+    public static void AddPrim(int otAddress, POLY_GT4Ref p) => AddPrim(otAddress, p.Address);
 }

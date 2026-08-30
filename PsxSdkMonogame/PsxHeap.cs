@@ -60,6 +60,15 @@ public static class PsxHeap
 
         s_baseAddress = baseAddress;
         s_storage = new byte[size];
+
+        // JUSTIFICATION: PSX hardware adaptation only
+        // RELATION: the heap is a span of PSX RAM like any other, so it declares its address to
+        // LibGpu's registry too. Without this a primitive that malloc handed out has no address
+        // AddPrim can splice into an ordering-table bucket, and it silently never draws. TITLE.EXE
+        // reaches exactly that case: the title task FUN_80021e28 @ 0x80021E28 keeps its two
+        // background quads in its heap-allocated task context.
+        LibGpu.RamRegion(baseAddress, s_storage);
+
         MipsMemory.WriteI32(s_storage, 0, size - HeaderSize);
         MipsMemory.WriteI32(s_storage, 4, 0);
     }
