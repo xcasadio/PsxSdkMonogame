@@ -1027,6 +1027,18 @@ public static class LibGte
     // translation column and returns the matrix.
     // Name left raw: Ghidra's own note calls it a "Possible MTX_07.OBJ/TransMatrix" — probable, not
     // proven, so the raw name stands per the naming rules.
+    // JUSTIFICATION: C# language bridge only
+    // RELATION: libgte declares TransMatrix(MATRIX *, VECTOR *). The int[] form below predates
+    // this one; call sites that hold a real VECTOR, such as FUN_80037388 @ 0x80037388, reach this
+    // overload instead of unpacking the vector at every call.
+    public static MATRIX TransMatrix(MATRIX matrix, VECTOR v)
+    {
+        matrix.t[0] = v.vx;
+        matrix.t[1] = v.vy;
+        matrix.t[2] = v.vz;
+        return matrix;
+    }
+
     public static MATRIX TransMatrix(MATRIX matrix, int[] param_2)
     {
         int lVar1;
