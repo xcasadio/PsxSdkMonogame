@@ -1405,10 +1405,34 @@ public static class LibGpu
     // with a format string naming themselves. Reading that string out of SLUS_006.62 identifies
     // the address outright.
     // The real body then dispatches through the GPU vector table's +0x20 entry with size 8.
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: the u_long* form of LoadImage, used when the source is a local buffer rather than a
+    // PSX address — FUN_80038228 @ 0x80038228 builds its 2x1 fade texture on the stack that way.
+    // It was a stub, so such a call configured its primitive and then uploaded nothing.
+    //
+    // A PSX u_long is 32 bits while a C# ulong is 64, so this cannot be a byte-for-byte mirror.
+    // The convention is that each element carries one PSX word in its low 32 bits, which is what a
+    // transliterated call site writing a 0x1111FFFF word produces. Everything past that point
+    // goes through the ordinary byte[] path, so the VRAM write is identical.
     public static int LoadImage(RECT rect, ulong[] p)
     {
-        // Do nothing PSX SDK
-        return 0;
+        if (rect == null || rect.w <= 0 || rect.h <= 0 || p == null)
+        {
+            return 0;
+        }
+
+        byte[] source = new byte[p.Length * 4];
+        for (int i = 0; i < p.Length; i++)
+        {
+            uint word = (uint)p[i];
+            source[(i * 4) + 0] = (byte)word;
+            source[(i * 4) + 1] = (byte)(word >> 8);
+            source[(i * 4) + 2] = (byte)(word >> 16);
+            source[(i * 4) + 3] = (byte)(word >> 24);
+        }
+
+        LoadImage(rect, source, 0);
+        return 1;
     }
 
     // JUSTIFICATION: PSX hardware adaptation only — resolves a raw PSX RAM address (stored as int)
