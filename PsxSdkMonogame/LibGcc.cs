@@ -58,7 +58,7 @@ public static class LibGcc
     // GHIDRA: __subdf3 @ 0x8004E304
     // JUSTIFICATION: C# language bridge only
     // RELATION: 116 bytes — it flips the second operand's sign bit and tail-calls __adddf3. Its one
-    // caller in this slice is MenuIntro.FUN_8002ea8c, which uses it to decay the logo's scale.
+    // caller in this slice is MenuIntro.BuildModeMenuScreen, which uses it to decay the logo's scale.
     public static double __subdf3(double param_1, double param_2)
     {
         return param_1 - param_2;

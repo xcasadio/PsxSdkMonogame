@@ -377,7 +377,7 @@ public static class LibCd
     //     FUN_80030908 @ 0x80030908 line 21   do { CdControlB(0x0E, {0x80}, 0); } while (r == 0)
     //     FUN_800258F0 @ 0x800258F0 line 19   do { CdControlB(0x0A, 0, result); } while (r == 0)
     //     FUN_800258F0 @ 0x800258F0 line 22   do { CdControlB(0x0E, mode, result); } while (r == 0)
-    //     FUN_80025894 @ 0x80025894 lines 8/11 the same two loops for 0x0A and 0x08
+    //     StopCdAudio @ 0x80025894 lines 8/11 the same two loops for 0x0A and 0x08
     //     FUN_80025788 @ 0x80025788 line 21   do { CdControl(0x03, &toc[n], r); } while (r == 0)
     // The bodies below are transliterated instead, so the loops terminate because the routine
     // says so — not because a command was special-cased.
@@ -803,7 +803,7 @@ public static class LibCd
     // =======================================================================================
     //
     // CLOSED 2026-08-30 from /SELECT.EXE. CdGetToc @ 0x80047808 is 36 bytes and does nothing but
-    // `return CdGetToc2(1, loc);`. Its one caller in the image is FUN_80025658 @ 0x800256B4, the
+    // `return CdGetToc2(1, loc);`. Its one caller in the image is InitializeCdAudio @ 0x800256B4, the
     // CD-DA bring-up, as `CdGetToc((CdlLOC *)&DAT_80055CEC)` — the 32-entry TOC array.
     //
     // WHAT CdGetToc2 @ 0x8004782C DOES, in order:
@@ -819,7 +819,7 @@ public static class LibCd
     // `02 20 10 21  addu v0,s1,zero` in the delay slot, s1 being the counter the decompiler calls
     // iVar3. It starts at 1 for the lead-out entry and is incremented once per CdlGetTD attempt,
     // INCLUDING the attempt that fails and jumps to the error tail — which discards it and returns
-    // 0 instead. So the success value is 1 + (last - first + 1). FUN_80025658 keeps it as
+    // 0 instead. So the success value is 1 + (last - first + 1). InitializeCdAudio keeps it as
     // `DAT_80055AB0 = CdGetToc(...) - 1`.
     //
     // BLOCKED — THE TOC IS NOT RECOVERABLE IN THIS PORT, AND NOTHING BELOW INVENTS ONE.
@@ -843,7 +843,7 @@ public static class LibCd
     // HAZARD WORTH RECORDING, not introduced here and not repaired here: an all-zero TOC entry fed
     // to CdlSetloc/CdlPlay makes CD_cw latch s_lastSeekTarget at 00:00:00, which is LBA -150, which
     // LibDs.FindRegistrationContaining resolves to nothing — a following CdRead would return 0 for
-    // ever inside ReadCDData's `while (CdRead(...) != 1)`. FUN_80025658 and FUN_800258F0 are still
+    // ever inside ReadCDData's `while (CdRead(...) != 1)`. InitializeCdAudio and FUN_800258F0 are still
     // BLOCKED stubs in SELECT_EXE/SelectScreen.cs, so nothing reaches it today, and the array they
     // would pass was already zero-filled before this change.
 
@@ -952,7 +952,7 @@ public static class LibCd
 
     // GHIDRA: CdGetToc @ 0x80047808 (SELECT.EXE)
     // The parameter was `CdlLOC loc` before this tranche, a single entry. The original's `CdlLOC *`
-    // is the head of the caller's 32-entry array — FUN_80025658 passes &DAT_80055CEC and then walks
+    // is the head of the caller's 32-entry array — InitializeCdAudio passes &DAT_80055CEC and then walks
     // it with `p = p + 1` — so the port takes the array. Nothing called the old single-entry form.
     public static int CdGetToc(CdlLOC[] loc)
     {

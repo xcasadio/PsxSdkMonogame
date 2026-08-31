@@ -365,7 +365,7 @@ public static class LibGs
     // ROUTINES
     // ================================================================================
 
-    // GHIDRA: FUN_8004d2a0 @ 0x8004D2A0 (SELECT.EXE)
+    // GHIDRA: GetVideoMode @ 0x8004D2A0 (SELECT.EXE)
     // The whole body is two instructions, `lui v0,0x8005; lw v0,0x5964(v0)` — it returns the 32-bit
     // word DAT_80055964 @ 0x80055964. Ghidra's plate reads "Possible VMODE.OBJ/GetVideoMode".
     // DAT_80055964 has exactly ONE cross-reference in the whole of SELECT.EXE (this read), and its
@@ -373,7 +373,7 @@ public static class LibGs
     // gpu_init's PAL branch below is dead code. LibEtc.GetVideoMode() returns the same 0.
     // It sits at 0x8004D2A0, inside libetc, not libgs; it lives here only because LibEtc.cs is owned
     // by a later phase and gpu_init needs it now.
-    private static int FUN_8004d2a0()
+    private static int GetVideoMode()
     {
         return (int)LibEtc.GetVideoMode();
     }
@@ -415,7 +415,7 @@ public static class LibGs
         DAT_800597b8.screen.h = 0;
         DAT_800597b8.disp.w = (short)param_1;
         DAT_800597b8.disp.h = (short)param_2;
-        int iVar1 = FUN_8004d2a0();
+        int iVar1 = GetVideoMode();
         if (iVar1 == 1)
         {
             DAT_800597b8.screen.y = 0x18;
@@ -565,7 +565,7 @@ public static class LibGs
         DAT_800662fc = 0x3fff;
     }
 
-    // GHIDRA: FUN_8004879c @ 0x8004879C (SELECT.EXE)
+    // GHIDRA: GsDefDispBuff @ 0x8004879C (SELECT.EXE)
     // Ghidra leaves it unnamed but plates it "Possible GS_103.OBJ/GsDefDispBuff", and the body is
     // GsDefDispBuff's: it takes the two buffer origins (x0, y0, x1, y1) and writes both the draw
     // pair and the display pair, then re-arms the clip and the offset.
@@ -601,7 +601,7 @@ public static class LibGs
         return DAT_800691c0;
     }
 
-    // GHIDRA: FUN_8004883c @ 0x8004883C (SELECT.EXE)
+    // GHIDRA: GsSetWorkBase @ 0x8004883C (SELECT.EXE)
     // Ghidra leaves it unnamed and plates three candidates (GsSetNearClip / GsSetFarClip /
     // GsSetWorkBase), all of which are one-store functions. GsSetWorkBase is the one that fits the
     // USE: its single argument lands in DAT_80059430 @ 0x80059430, and GsSortLine, GsSortSprite and
