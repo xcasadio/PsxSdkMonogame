@@ -1853,7 +1853,65 @@ public static class LibGpu
         // simply the walk order.
         for (int i = 0; i < visitOrder.Count; i++)
         {
-            RasterizePrimitivePacket(visitOrder[i], visitOffset[i]);
+            RasterizeOrderingTableNode(visitOrder[i], visitOffset[i]);
+        }
+    }
+
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: no single original counterpart — this stands in for the GPU's DMA linked-list
+    // transfer of ONE ordering-table node. A node is a TAG followed by a stream of GP0 command
+    // words, and the tag's LENGTH byte (at tagOffset + 3) counts those words; real DMA submits
+    // every one of them, in order, to the command FIFO. That is all this does.
+    //
+    // FIXED 2026-08-31, and the defect it closes was MEASURED rather than reasoned about.
+    // RasterizePrimitivePacket handles ONE command per node, and for a DR_TPAGE it used to recurse
+    // at offset + 8 — which assumes the next thing is another TAG. That assumption comes from PsyQ
+    // MargePrim (see the 0xE1 arm below), which zeroes the absorbed primitive's tag word, so the
+    // sibling really does begin at a tag two words later.
+    //
+    // libgs does NOT build that shape. GsSortSprite's fast path (LibGs.cs, GsSortSprite
+    // @ 0x8004820C) emits ONE tag of length 5 followed by five command words and NO inner tag:
+    //     +0x00  tag, length byte 5
+    //     +0x04  0xE1......   DR_TPAGE      1 word
+    //     +0x08  0x64......   SPRT header   4 words: header, xy, uv|clut, w|h
+    //     +0x0C  xy
+    //     +0x10  uv | clut
+    //     +0x14  w | h<<16
+    // The recursion therefore landed on +0x08 expecting a tag and read its opcode from +0x0F — the
+    // TOP BYTE OF THE XY WORD — instead of the SPRT header at +0x08, so the sprite was never drawn.
+    // SELECT.EXE's menu intro arms six 59x240 bands with correct geometry, they take the fast path,
+    // and the frame came back with ZERO lit pixels.
+    //
+    // Walking the tag length instead makes both shapes fall out with no special case: libgs's
+    // DR_TPAGE + SPRT is 1 + 4 = 5 words, and MargePrim's zeroed inner tag is a word whose opcode
+    // byte is 0, which consumes one word and draws nothing.
+    private static void RasterizeOrderingTableNode(byte[] buf, int tagOffset)
+    {
+        if (buf == null || tagOffset < 0 || tagOffset + 4 > buf.Length)
+        {
+            return;
+        }
+
+        int len = buf[tagOffset + 3];
+        int w = 0;
+
+        // RasterizePrimitivePacket's `offset` is a TAG position and it reads its command word at
+        // offset + 4; that convention is kept, so every field access inside it stays valid. Handing
+        // it the SYNTHETIC tag position tagOffset + w*4 therefore puts its command word at
+        // tagOffset + 4 + w*4, which is command word w of this node. w == 0 is the node's own tag,
+        // i.e. the ordinary single-primitive case, unchanged.
+        while (w < len)
+        {
+            int consumed = RasterizePrimitivePacket(buf, tagOffset + w * 4);
+
+            // An unrecognised opcode returns 1, so this cannot spin; the guard covers a truncated
+            // buffer (0) and anything a future arm gets wrong.
+            if (consumed <= 0)
+            {
+                break;
+            }
+
+            w += consumed;
         }
     }
 
@@ -1924,11 +1982,27 @@ public static class LibGpu
         return (uint)(buf[at] | (buf[at + 1] << 8) | (buf[at + 2] << 16));
     }
 
-    private static void RasterizePrimitivePacket(byte[] buf, int offset)
+    // RETURNS the number of GP0 COMMAND WORDS this packet consumes — not counting the tag word at
+    // `offset`, which is what a tag's length byte counts too, so the two are directly comparable.
+    // RasterizeOrderingTableNode above walks a node by summing these. Zero means "nothing could be
+    // read" (a truncated buffer) and stops the walk; an unrecognised opcode returns 1 and draws
+    // nothing, so it can never desynchronise the walk.
+    //
+    // Every count below is DERIVED, never guessed. The state commands return what they actually
+    // read. The primitive arms return their existing bounds-check byte figure / 4 - 1, because that
+    // figure is measured from the TAG and therefore includes the tag word. That arithmetic is
+    // confirmed against the tag lengths this SDK's own setters stamp (see SetPolyF3 and its
+    // neighbours near the end of this file), which are the psyq constants read out of TITLE.EXE:
+    //   TILE 16B/3    TILE_8,TILE_16 12B/2   SPRT 20B/4    SPRT_8,SPRT_16 16B/3
+    //   POLY_F3 20B/4     POLY_FT3 32B/7     POLY_F4 24B/5     POLY_FT4 40B/9
+    //   POLY_G3 28B/6     POLY_GT3 40B/9     POLY_G4 36B/8     POLY_GT4 52B/12
+    //   LINE_F2 16B/3     LINE_G2 20B/4
+    // Each of those is N/4 - 1 == the stamped length, on every single arm.
+    private static int RasterizePrimitivePacket(byte[] buf, int offset)
     {
         if (offset + 8 > buf.Length)
         {
-            return;
+            return 0;
         }
 
         byte cmd = buf[offset + 7];
@@ -1948,20 +2022,31 @@ public static class LibGpu
             // 0x80077cb4) is ONE ordering-table node holding several GP0 commands back to back, and
             // real DMA submits every word the tag's LENGTH byte covers. This dispatcher handles one
             // command per call, so a merge used to execute the DR_TPAGE and silently drop whatever
-            // followed it — which is why no dialogue glyph and no dialogue backdrop bar has ever
-            // been drawn (TextSystem builds every glyph as DR_TPAGE + SPRT merged into one packet).
+            // followed it — which is why no dialogue glyph and no dialogue backdrop bar had been
+            // drawn (TextSystem builds every glyph as DR_TPAGE + SPRT merged into one packet).
             // MargePrim zeroes the absorbed primitive's tag word, so the sibling still begins at a
             // tag exactly one DR_TPAGE (2 words) later and can be dispatched as an ordinary packet.
-            // PARTIAL, stated rather than hidden: only this DR_TPAGE + one-primitive shape is
-            // modelled, because it is the only one the game builds — all five merge sites
-            // (TextSystem's glyph/cursor/overlay pairs, CombatHud's InitTPageSprtPrim /
-            // InitTPageTilePrim) pair a DR_TPAGE with exactly one following primitive.
-            if (buf[offset + 3] > 1)
-            {
-                RasterizePrimitivePacket(buf, offset + 8);
-            }
-
-            return;
+            //
+            // EXTENDED 2026-08-31: that used to be handled HERE, by `if (buf[offset + 3] > 1)
+            // RasterizePrimitivePacket(buf, offset + 8)` — a recursion that assumed the next thing
+            // after a DR_TPAGE is another TAG. True of MargePrim's output, and only of MargePrim's
+            // output: libgs merges the same two commands with NO inner tag, and the recursion then
+            // read its opcode from the top byte of the sprite's XY word. The tag length is now
+            // walked one command at a time by RasterizeOrderingTableNode, where the evidence for
+            // both shapes is recorded, and this arm just reports what a GP0(0xE1) costs. The
+            // MargePrim shape still works, unchanged: its zeroed inner tag word is an opcode-0
+            // command that consumes one word and draws nothing, which lands the walk on the
+            // absorbed primitive at exactly the offset this recursion used to hand it.
+            //
+            // The note that stood here also recorded, as a PARTIAL, that only the DR_TPAGE +
+            // ONE-primitive shape was modelled — all five MargePrim sites (TextSystem's
+            // glyph/cursor/overlay pairs, CombatHud's InitTPageSprtPrim / InitTPageTilePrim) pair a
+            // DR_TPAGE with exactly one following primitive. That inventory is still true and still
+            // worth having, but it is no longer a limitation: the walk is driven by the tag length,
+            // so a node holding any number of commands is submitted in full, as the hardware does.
+            //
+            // GP0(0xE1) is a single command word, and SetDrawTPage stamps tag length 1 for it.
+            return 1;
         }
 
         if (cmd == 0xE2)
@@ -1972,7 +2057,7 @@ public static class LibGpu
             // nothing — which is exactly how a first attempt at this looked correct and was not.
             if (offset + 8 > buf.Length)
             {
-                return;
+                return 0;
             }
 
             uint tw = ReadU32(buf, offset + 4) & 0xfffff;
@@ -1980,14 +2065,15 @@ public static class LibGpu
             s_gpuTexWindowMaskY = (int)((tw >> 5) & 0x1f);
             s_gpuTexWindowOffsetX = (int)((tw >> 10) & 0x1f);
             s_gpuTexWindowOffsetY = (int)((tw >> 15) & 0x1f);
-            return;
+            // ONE word read, at offset + 4: GP0(0xE2) is a single command word.
+            return 1;
         }
 
         if (cmd == 0xE3)
         {
             if (offset + 12 > buf.Length)
             {
-                return;
+                return 0;
             }
 
             uint topLeft = ReadU32(buf, offset + 4);
@@ -1999,7 +2085,10 @@ public static class LibGpu
             s_gpuClipY0 = (short)((topLeft >> 10) & 0x1ff);
             s_gpuClipX1 = (short)(bottomRight & 0x3ff);
             s_gpuClipY1 = (short)((bottomRight >> 10) & 0x1ff);
-            return;
+            // TWO words read, at offset + 4 and offset + 8: this arm covers GP0(0xE3) AND its
+            // sibling GP0(0xE4) (drawing area top-left and bottom-right), which is exactly the
+            // psyq DR_AREA packet — tag + code[2], tag length 2.
+            return 2;
         }
 
         uint bgr = (uint)(buf[offset + 4] | (buf[offset + 5] << 8) | (buf[offset + 6] << 16));
@@ -2022,7 +2111,7 @@ public static class LibGpu
             int minLen = sizeSelector == 0 ? (textured ? 20 : 16) : (textured ? 16 : 12);
             if (offset + minLen > buf.Length)
             {
-                return;
+                return 0;
             }
 
             // GP0(0xE5): the GPU adds the drawing offset to every primitive vertex.
@@ -2044,6 +2133,13 @@ public static class LibGpu
                 short h = sizeSelector == 0 ? ReadI16(buf, offset + 14) : fixedSize;
                 FillRect(x, y, w, h, bgr, semiTransparent);
             }
+
+            // `minLen` is the packet's size in bytes MEASURED FROM THE TAG, so the command-word
+            // count is minLen/4 - 1. All four combinations agree with the psyq tag lengths this
+            // SDK stamps: SPRT 20/4, TILE 16/3, SPRT_8 and SPRT_16 16/3 (SetTile8 @0x80077C24's
+            // sibling; InitFrontendSpriteEntryPrims writes 3 too), TILE_1/8/16 12/2 (SetTile8
+            // stamps exactly 2). SetTile @0x80077C44 stamps 3, which is 16/4 - 1.
+            return minLen / 4 - 1;
         }
         else if (category == 0x40)
         {
@@ -2070,29 +2166,38 @@ public static class LibGpu
             //   LINE_F2: +0x0C xy1
             bool gouraud = (cmd & 0x10) != 0;
             bool polyLine = (cmd & 0x08) != 0;
-            if (!polyLine)
+            if (polyLine)
             {
-                int lx0 = ReadI16(buf, offset + 8) + s_gpuDrawOffsetX;
-                int ly0 = ReadI16(buf, offset + 10) + s_gpuDrawOffsetY;
-                int secondVertex = gouraud ? offset + 0x10 : offset + 0x0c;
-                if (secondVertex + 4 <= buf.Length)
-                {
-                    int lx1 = ReadI16(buf, secondVertex) + s_gpuDrawOffsetX;
-                    int ly1 = ReadI16(buf, secondVertex + 2) + s_gpuDrawOffsetY;
-                    byte r0 = buf[offset + 4], g0 = buf[offset + 5], b0 = buf[offset + 6];
-                    byte r1 = r0, g1 = g0, b1 = b0;
-                    if (gouraud && offset + 0x0f <= buf.Length)
-                    {
-                        r1 = buf[offset + 0x0c];
-                        g1 = buf[offset + 0x0d];
-                        b1 = buf[offset + 0x0e];
-                    }
-                    // `gouraud` doubles as the dither predicate — see DrawGouraudLine.
-                    DrawGouraudLine(lx0, ly0, lx1, ly1, r0, g0, b0, r1, g1, b1, semiTransparent, gouraud);
-                }
+                // Still not DRAWN — see the PARTIAL note above. But the walker has to know how wide
+                // the command is, or the vertex words behind it would be dispatched as commands.
+                return CountPolyLineWords(buf, offset);
             }
 
-            return;
+            // LINE_G2 is 20 bytes from the tag and LINE_F2 16, so 4 and 3 command words. The
+            // remark above already records tag length 4 for the 0x50 packets MeshWireframe writes,
+            // and 20/4 - 1 == 4 / 16/4 - 1 == 3 agree with it.
+            int lineBytes = gouraud ? 20 : 16;
+            if (offset + lineBytes > buf.Length)
+            {
+                return 0;
+            }
+
+            int lx0 = ReadI16(buf, offset + 8) + s_gpuDrawOffsetX;
+            int ly0 = ReadI16(buf, offset + 10) + s_gpuDrawOffsetY;
+            int secondVertex = gouraud ? offset + 0x10 : offset + 0x0c;
+            int lx1 = ReadI16(buf, secondVertex) + s_gpuDrawOffsetX;
+            int ly1 = ReadI16(buf, secondVertex + 2) + s_gpuDrawOffsetY;
+            byte r0 = buf[offset + 4], g0 = buf[offset + 5], b0 = buf[offset + 6];
+            byte r1 = r0, g1 = g0, b1 = b0;
+            if (gouraud)
+            {
+                r1 = buf[offset + 0x0c];
+                g1 = buf[offset + 0x0d];
+                b1 = buf[offset + 0x0e];
+            }
+            // `gouraud` doubles as the dither predicate — see DrawGouraudLine.
+            DrawGouraudLine(lx0, ly0, lx1, ly1, r0, g0, b0, r1, g1, b1, semiTransparent, gouraud);
+            return lineBytes / 4 - 1;
         }
         else if (category == 0x20)
         {
@@ -2132,10 +2237,12 @@ public static class LibGpu
             {
                 if (textured)
                 {
+                    // POLY_GT4 52 bytes / SetPolyGT4 @0x8007126C stamps tag length 12 == 52/4 - 1;
+                    // POLY_GT3 40 bytes / SetPolyGT3 @0x8007121C stamps 9 == 40/4 - 1.
                     int need = quad ? 52 : 40;
                     if (offset + need > buf.Length)
                     {
-                        return;
+                        return 0;
                     }
 
                     int gx0 = ReadI16(buf, offset + 8) + s_gpuDrawOffsetX;
@@ -2175,14 +2282,16 @@ public static class LibGpu
                             gclut, gtpage, semiTransparent);
                     }
 
-                    return;
+                    return need / 4 - 1;
                 }
                 else
                 {
+                    // POLY_G4 36 bytes / SetPolyG4 @0x80077BC4 stamps tag length 8 == 36/4 - 1;
+                    // POLY_G3 28 bytes / SetPolyG3 @0x80077B84 stamps 6 == 28/4 - 1.
                     int need = quad ? 36 : 28;
                     if (offset + need > buf.Length)
                     {
-                        return;
+                        return 0;
                     }
 
                     int gx0 = ReadI16(buf, offset + 8) + s_gpuDrawOffsetX;
@@ -2204,7 +2313,7 @@ public static class LibGpu
                         FillGouraudTriangle(gx1, gy1, gbgr1, gx3, gy3, gbgr3, gx2, gy2, gbgr2, semiTransparent);
                     }
 
-                    return;
+                    return need / 4 - 1;
                 }
             }
 
@@ -2223,7 +2332,7 @@ public static class LibGpu
                 // of the arms that dithers (see PlotPixel).
                 if (offset + 40 > buf.Length)
                 {
-                    return;
+                    return 0;
                 }
 
                 int x0 = ReadI16(buf, offset + 8) + s_gpuDrawOffsetX;
@@ -2253,7 +2362,8 @@ public static class LibGpu
                     clut, tpage, bgr, semiTransparent);
                 FillTexturedTriangle(x1, y1, u1, v1, x3, y3, u3, v3, x2, y2, u2, v2,
                     clut, tpage, bgr, semiTransparent);
-                return;
+                // 40 bytes from the tag; SetPolyFT4 @0x80071244 stamps tag length 9 == 40/4 - 1.
+                return 9;
             }
 
             if (textured)
@@ -2261,7 +2371,7 @@ public static class LibGpu
                 // POLY_FT3: tag(4) + colour/cmd(4) + 3x[xy(4) + uv/clut-or-tpage(4)] = 32 bytes.
                 if (offset + 32 > buf.Length)
                 {
-                    return;
+                    return 0;
                 }
 
                 int tx0 = ReadI16(buf, offset + 8) + s_gpuDrawOffsetX;
@@ -2281,7 +2391,8 @@ public static class LibGpu
                 byte tv2 = buf[offset + 29];
                 FillTexturedTriangle(tx0, ty0, tu0, tv0, tx1, ty1, tu1, tv1, tx2, ty2, tu2, tv2,
                     tclut, ttpage, bgr, semiTransparent);
-                return;
+                // 32 bytes from the tag; SetPolyFT3 @0x800711F4 stamps tag length 7 == 32/4 - 1.
+                return 7;
             }
 
             if (quad)
@@ -2289,7 +2400,7 @@ public static class LibGpu
                 // POLY_F4: tag(4) + colour/cmd(4) + 4x xy(4) = 24 bytes.
                 if (offset + 24 > buf.Length)
                 {
-                    return;
+                    return 0;
                 }
 
                 int qx0 = ReadI16(buf, offset + 8) + s_gpuDrawOffsetX;
@@ -2302,12 +2413,14 @@ public static class LibGpu
                 int qy3 = ReadI16(buf, offset + 22) + s_gpuDrawOffsetY;
                 FillTriangle(qx0, qy0, qx1, qy1, qx2, qy2, bgr, semiTransparent);
                 FillTriangle(qx1, qy1, qx3, qy3, qx2, qy2, bgr, semiTransparent);
-                return;
+                // 24 bytes from the tag; SetPolyF4 @0x80071230 stamps tag length 5 == 24/4 - 1.
+                return 5;
             }
 
+            // POLY_F3: 20 bytes from the tag.
             if (offset + 20 > buf.Length)
             {
-                return;
+                return 0;
             }
 
             int px0 = ReadI16(buf, offset + 8) + s_gpuDrawOffsetX;
@@ -2317,9 +2430,41 @@ public static class LibGpu
             int px2 = ReadI16(buf, offset + 16) + s_gpuDrawOffsetX;
             int py2 = ReadI16(buf, offset + 18) + s_gpuDrawOffsetY;
             FillTriangle(px0, py0, px1, py1, px2, py2, bgr, semiTransparent);
+            // SetPolyF3 @0x800711E0 stamps tag length 4 == 20/4 - 1.
+            return 4;
         }
 
-        // else: LINE_F2/F4 (0x40) and anything else — extension point for the future full version.
+        // Anything else — extension point for the future full version. An opcode this dispatcher
+        // does not recognise consumes exactly ONE word and draws nothing, which is what keeps the
+        // node walk in step: MargePrim's zeroed inner tag word arrives here (opcode 0) and steps
+        // the walk onto the absorbed primitive, and GsSortClear's GP0(0x02) block fill arrives here
+        // too. Never return 0 from this path — 0 stops the walk, and an unknown command must not.
+        return 1;
+    }
+
+    // JUSTIFICATION: PSX hardware adaptation only
+    // RELATION: no original counterpart — the GP0 poly-line commands (0x48/0x58, the LINE_F3/F4 and
+    // LINE_G3/G4 forms) have NO fixed length: the hardware consumes vertex words until it reads the
+    // terminator 0x55555555. The dispatcher above deliberately does not draw one, but the walk still
+    // has to step over it by the right number of words, or the vertices behind it get dispatched as
+    // if they were commands.
+    // The count this produces is exactly the psyq tag length for those packets: LINE_F3 is 24 bytes
+    // (colour/code, xy0, xy1, xy2, terminator = 5 words) and LINE_G4 is 40 (9 words).
+    // A packet with no terminator inside the buffer is malformed or truncated, so it returns 0 and
+    // ends the node rather than guessing a length.
+    private static int CountPolyLineWords(byte[] buf, int offset)
+    {
+        // Word 0 is the colour/code word the opcode itself lives in; the terminator can only be
+        // one of the words after it.
+        for (int i = 1; offset + 4 + i * 4 + 4 <= buf.Length; i++)
+        {
+            if (ReadU32(buf, offset + 4 + i * 4) == 0x55555555u)
+            {
+                return i + 1;
+            }
+        }
+
+        return 0;
     }
 
     // JUSTIFICATION: PSX hardware adaptation only — a TEXTURED POLYGON carries its own texpage
