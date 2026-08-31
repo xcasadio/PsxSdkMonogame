@@ -566,9 +566,9 @@ public static class LibGs
     }
 
     // GHIDRA: GsDefDispBuff @ 0x8004879C (SELECT.EXE)
-    // Ghidra leaves it unnamed but plates it "Possible GS_103.OBJ/GsDefDispBuff", and the body is
-    // GsDefDispBuff's: it takes the two buffer origins (x0, y0, x1, y1) and writes both the draw
-    // pair and the display pair, then re-arms the clip and the offset.
+    // Ghidra plates it "Possible GS_103.OBJ/GsDefDispBuff", and the body is GsDefDispBuff's: it
+    // takes the two buffer origins (x0, y0, x1, y1) and writes both the draw pair and the display
+    // pair, then re-arms the clip and the offset. It now carries that name in Ghidra too.
     // SELECT.EXE calls GsDefDispBuff(0, 0, 0x140, 0) — buffer 0 at VRAM (0,0), buffer 1 at (320,0).
     public static void GsDefDispBuff(short param_1, short param_2, short param_3, short param_4)
     {
@@ -602,8 +602,8 @@ public static class LibGs
     }
 
     // GHIDRA: GsSetWorkBase @ 0x8004883C (SELECT.EXE)
-    // Ghidra leaves it unnamed and plates three candidates (GsSetNearClip / GsSetFarClip /
-    // GsSetWorkBase), all of which are one-store functions. GsSetWorkBase is the one that fits the
+    // Ghidra plates three candidates (GsSetNearClip / GsSetFarClip / GsSetWorkBase), all of which
+    // are one-store functions, and now carries the third. GsSetWorkBase is the one that fits the
     // USE: its single argument lands in DAT_80059430 @ 0x80059430, and GsSortLine, GsSortSprite and
     // GsSortBoxFill all read DAT_80059430 as the address they write their packet words through. A
     // near- or far-clip scalar could not be dereferenced that way. SELECT.EXE's frame step calls it
