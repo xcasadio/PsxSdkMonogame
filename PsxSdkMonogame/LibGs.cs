@@ -258,7 +258,9 @@ public static class LibGs
     // A 32-byte MATRIX image that valiable_init fills with the identity: shorts 0x1000 at +0x00,
     // +0x08 and +0x10, zero at +0x02/+0x04/+0x06/+0x0A/+0x0C/+0x0E, and three zero words at +0x14,
     // +0x18, +0x1C. +0x12 — the MATRIX pad — is never written by any instruction in the function.
-    // PARTIAL: nothing in SELECT.EXE reads it, so which libgs matrix it is stays unnamed.
+    // GsSortSprite reads it as the rotation matrix of its unrotated matrix path, which is what
+    // the identity is for: at unit scale the projection then reproduces, exactly, the rectangle
+    // the fast path emits. SortSpriteValidation drives both routes and compares them.
     public static readonly byte[] DAT_800653d8 = new byte[32];
 
     // GHIDRA: DAT_80066300 @ 0x80066300 (SELECT.EXE)
