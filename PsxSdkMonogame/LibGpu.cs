@@ -2434,11 +2434,72 @@ public static class LibGpu
             return 4;
         }
 
-        // Anything else — extension point for the future full version. An opcode this dispatcher
+        // GP0(0x02) FILL RECTANGLE IN VRAM. Three words: colour+command, top-left, then size.
+        //
+        // This is what CLEARS THE FRAME. GsSortClear @ 0x80047F14 (SELECT.EXE) builds exactly this
+        // packet and sorts it into the ordering table every frame; its field layout is that
+        // routine's own stores, read out of LibGs.GsSortClear: r/g/b at +4/+5/+6, x at +8, y at
+        // +0x0a, w at +0x0c, h at +0x0e, tag length 3.
+        //
+        // Without an arm here the command fell to the unknown path below, so the draw buffer was
+        // never cleared and every frame composited on top of the last. SELECT.EXE's menu made that
+        // visible: its dragon-ball background accumulated over hundreds of frames into concentric
+        // ripples, because the sprites were redrawn each frame and nothing ever erased them.
+        //
+        // It is a RAW VRAM WRITE, not a primitive: on the hardware it ignores the drawing area, the
+        // draw offset, semi-transparency, dithering and the mask bit. So it does not go through
+        // PlotPixel - that would clip the clear to the drawing area and defeat its purpose when the
+        // buffer origin and the clip disagree.
+        //
+        // PARTIAL: the hardware also rounds x down and w up to a multiple of 16. Not modelled,
+        // because nothing here exercises it - GsSortClear passes the buffer origin and the screen
+        // width, and this game's buffers are 320 wide at x = 0.
+        if (cmd == 0x02)
+        {
+            if (offset + 16 > buf.Length)
+            {
+                return 0;
+            }
+
+            uint fillBgr = ReadU32(buf, offset + 4) & 0xffffff;
+            int fx = ReadI16(buf, offset + 8);
+            int fy = ReadI16(buf, offset + 10);
+            int fw = ReadI16(buf, offset + 12);
+            int fh = ReadI16(buf, offset + 14);
+
+            byte fr = (byte)fillBgr;
+            byte fg = (byte)(fillBgr >> 8);
+            byte fb = (byte)(fillBgr >> 16);
+            ushort cell = (ushort)((fr >> 3) | ((fg >> 3) << 5) | ((fb >> 3) << 10));
+
+            for (int yy = 0; yy < fh; yy++)
+            {
+                int vy = fy + yy;
+                if (vy < 0 || vy >= 512)
+                {
+                    continue;
+                }
+
+                int rowBase = vy * 1024;
+                for (int xx = 0; xx < fw; xx++)
+                {
+                    int vx = fx + xx;
+                    if (vx >= 0 && vx < 1024)
+                    {
+                        Vram[rowBase + vx] = cell;
+                    }
+                }
+            }
+
+            // GsSortClear stamps tag length 3 == 16/4 - 1.
+            return 3;
+        }
+
+        // Anything else - extension point for the future full version. An opcode this dispatcher
         // does not recognise consumes exactly ONE word and draws nothing, which is what keeps the
         // node walk in step: MargePrim's zeroed inner tag word arrives here (opcode 0) and steps
-        // the walk onto the absorbed primitive, and GsSortClear's GP0(0x02) block fill arrives here
-        // too. Never return 0 from this path — 0 stops the walk, and an unknown command must not.
+        // the walk onto the absorbed primitive. Never return 0 from this path - 0 stops the walk,
+        // and an unknown command must not.
         return 1;
     }
 
