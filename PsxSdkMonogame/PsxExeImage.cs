@@ -33,7 +33,8 @@ namespace PsxSdkMonogame;
 //     RamResolve FIRST and only then FileIo, FighterSetup, AnimVm, SharedHighRam and the heap,
 //     some of whose spans lie inside the image extent (0x8008DA48). As a region the image would
 //     have shadowed them. As the LAST link of every overlay's ?? chain it answers only where
-//     nothing else does, and only four of the five overlays consult RamResolve at all.
+//     nothing else does. (Only VS_EXE's chain consults RamResolve at all; the other four never
+//     do, which is why backing RamRegions would have changed nothing for them.)
 //
 //   * The region registry is capped at 64 rows and overflows in silence. One image, one buffer,
 //     zero rows.

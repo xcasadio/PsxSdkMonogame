@@ -53,6 +53,16 @@ public static class PsxHeap
     {
         if (size < HeaderSize + MinPayload)
         {
+            // THE PREVIOUS SPAN MUST NOT SURVIVE IN THE REGISTRY. This path emptied s_storage and
+            // returned, leaving the old heap's RamRegion row registered with nobody holding the
+            // buffer. On the game path SELECT.EXE arms 0x78ED5C bytes at 0x800692A0, then VS.EXE's
+            // start arms with a negative size and lands here: SELECT's heap stayed as a ZOMBIE row
+            // in the global registry, and since VS_EXE's resolver consults RamResolve first, every
+            // address above 0x800692A0 that no higher-based region claimed — the image's tables,
+            // FighterSetup's slot, FileIo's buffers — was served zeros out of a dead overlay's heap.
+            // Found by a fresh-context refutation that replayed the production InitHeap arguments;
+            // the same release the re-arm path below already does.
+            LibGpu.RamRelease(s_storage);
             s_storage = Array.Empty<byte>();
             s_baseAddress = 0;
             return;
